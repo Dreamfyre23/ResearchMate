@@ -1,0 +1,32 @@
+# ResearchMate dependencies.
+#
+# STATUS: candidate list. Version ranges were chosen from wheels published on
+# PyPI for Python 3.15.2 (Windows, 64-bit; DEC-025). They have NOT yet been
+# install-tested inside the project .venv. Confirm after creating the venv, then
+# tighten/pin versions (see docs/DEVELOPMENT_ENVIRONMENT.md section 6).
+#
+# Only libraries named in the project documents are listed. No agent frameworks.
+
+# MCP (DEC-005, DEC-006): official Python SDK, Streamable HTTP
+mcp>=2.3,<3
+
+# Database (DEC-012, DEC-013, DEC-014)
+sqlalchemy>=2.1,<2.2
+psycopg[binary]>=3.3,<3.4
+alembic>=1.20,<2
+
+# Configuration (PROJECT_REQUIREMENTS section 5)
+pydantic-settings>=2.16,<3
+
+# Orchestrator LLM (IMPLEMENTATION_PLAN Phase 10: google-genai SDK)
+google-genai>=2.34,<3
+
+# Local LLM client for Ollama (DEC-009). Not named explicitly in the docs;
+# see open questions in the setup report.
+ollama>=0.6,<1
+
+# Testing and linting (TEST_PLAN section 10)
+pytest>=9.2,<10
+pytest-asyncio>=1.4,<2
+pytest-mock>=3.17,<4
+ruff>=0.17,<0.18

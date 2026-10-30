@@ -1,0 +1,60 @@
+# ==============================================================================
+# ResearchMate — Git Ignore Rules
+# ==============================================================================
+
+# --- Secrets and local configuration (never commit) ---
+.env
+.env.*
+!.env.example
+*.local
+
+# --- Python environment and caches ---
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# --- Database dumps and local database files ---
+*.dump
+*.sql.gz
+*.db
+*.sqlite
+*.sqlite3
+
+# --- Logs (keep the folder structure, ignore runtime logs) ---
+logs/*
+!logs/.gitkeep
+*.log
+
+# --- Workspace data (keep subfolder structure, ignore user research assets) ---
+workspace/documents/*
+!workspace/documents/.gitkeep
+workspace/reports/*
+!workspace/reports/.gitkeep
+workspace/datasets/*
+!workspace/datasets/.gitkeep
+workspace/source_code/*
+!workspace/source_code/.gitkeep
+
+# --- Temporary and editor files ---
+*.tmp
+*.bak
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+Thumbs.db
+desktop.ini
+.DS_Store
