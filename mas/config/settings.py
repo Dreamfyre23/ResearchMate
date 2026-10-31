@@ -1,5 +1,7 @@
 """Configuration settings for Ollama integration and local AI agents (Phase 9)."""
 
+from typing import Any
+
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -72,9 +74,19 @@ class GeminiSettings(BaseSettings):
         description="Google Gemini API key from environment",
     )
     model: str = Field(
-        default="gemini-flash-latest",
+        default="gemini-3.5-flash-lite",
         validation_alias="GEMINI_MODEL",
-        description="Gemini model identifier for central orchestrator (DEC-008)",
+        description="Gemini model identifier for central orchestrator (legacy/fallback)",
+    )
+    primary_model: str | None = Field(
+        default=None,
+        validation_alias="GEMINI_PRIMARY_MODEL",
+        description="Primary Gemini model identifier (takes precedence over GEMINI_MODEL)",
+    )
+    fallback_models: str | None = Field(
+        default=None,
+        validation_alias="GEMINI_FALLBACK_MODELS",
+        description="Comma-separated list of fallback Gemini models in priority order",
     )
     timeout_seconds: float = Field(
         default=60.0,
@@ -86,6 +98,55 @@ class GeminiSettings(BaseSettings):
         validation_alias="GEMINI_TEMPERATURE",
         description="Sampling temperature for orchestrator planning and response synthesis",
     )
+    model_retry_attempts: int = Field(
+        default=1,
+        validation_alias="GEMINI_MODEL_RETRY_ATTEMPTS",
+        description="Number of retries per model for transient errors (503, timeouts) before switching",
+    )
+    model_retry_delay: float = Field(
+        default=0.5,
+        validation_alias="GEMINI_MODEL_RETRY_DELAY",
+        description="Delay in seconds between retries for transient errors",
+    )
+
+    def __init__(self, **values: Any) -> None:
+        super().__init__(**values)
+        if "model" in values and "primary_model" not in values:
+            self.primary_model = values["model"]
+        elif self.primary_model and "model" not in values:
+            self.model = self.primary_model
+
+    @property
+    def model_candidates(self) -> list[str]:
+        """Return the deduplicated, ordered list of model candidates.
+
+        Priority order:
+        1. primary_model (or model fallback)
+        2. fallback_models (comma-separated)
+
+        Preserves priority order, trims whitespace, removes empty and duplicate entries.
+        """
+        raw_candidates: list[str] = []
+        first_model = (self.primary_model or self.model or "").strip()
+        if first_model:
+            raw_candidates.append(first_model)
+
+        if self.fallback_models:
+            for item in self.fallback_models.split(","):
+                cleaned = item.strip()
+                if cleaned:
+                    raw_candidates.append(cleaned)
+
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for m in raw_candidates:
+            if m not in seen:
+                seen.add(m)
+                candidates.append(m)
+
+        if not candidates:
+            candidates = ["gemini-3.5-flash-lite"]
+        return candidates
 
     model_config = SettingsConfigDict(
         env_file=".env",

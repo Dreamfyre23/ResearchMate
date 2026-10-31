@@ -25,6 +25,10 @@ class GeminiRateLimitError(GeminiError):
     """Raised when Gemini API returns 429 / resource exhausted / rate limit exceeded."""
 
 
+class GeminiDailyQuotaExhaustedError(GeminiRateLimitError):
+    """Raised when the daily request quota for a Gemini model is exhausted."""
+
+
 class GeminiAPIError(GeminiError):
     """Raised when Gemini API encounters a server or inference error."""
 

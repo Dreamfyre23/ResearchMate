@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 from client_mcp.host import MCPHost
 from client_mcp.models import ToolDescriptor, ToolExecutionResult
+from mas.agents.models import ToolCallRecord
 from mas.agents.research_agent.agent import (
     RESEARCH_AGENT_PERMITTED_TOOLS,
     ResearchAgent,
@@ -24,9 +25,11 @@ from mas.agents.task_agent.agent import (
     TaskAgent,
 )
 from mas.agents.validator import (
+    evaluate_tool_records_success,
     is_deletion_authorized,
     is_note_deletion_authorized,
     is_task_deletion_authorized,
+    property_permits_null,
     validate_tool_call,
 )
 from mas.config.settings import AgentSettings
@@ -129,7 +132,8 @@ async def test_agent_permission_boundary_enforcement() -> None:
     agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
     res = await agent.run("Please create a task for me.")
 
-    assert res.is_success
+    assert res.is_success is False
+    assert "failed" in str(res.error).lower()
     assert res.iterations == 2
     assert len(res.tool_calls) == 1
     assert res.tool_calls[0].is_error is True
@@ -882,7 +886,8 @@ async def test_agent_blocks_destructive_tool_without_user_intent_e2e() -> None:
     agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
     res = await agent.run("What is the status of task 123?")
 
-    assert res.is_success is True
+    assert res.is_success is False
+    assert "failed" in str(res.error).lower()
     assert len(res.tool_calls) == 1
     assert res.tool_calls[0].is_error is True
     assert "Destructive operation 'delete_task' was blocked" in str(
@@ -992,7 +997,7 @@ async def test_unauthorized_agent_destructive_tool_calls_blocked() -> None:
     research_agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
     res = await research_agent.run("Delete task 123.")
 
-    assert res.is_success is True
+    assert res.is_success is False
     assert res.tool_calls[0].is_error is True
     assert (
         "Permission denied: Tool 'delete_task' is not permitted for Research Agent"
@@ -1016,10 +1021,498 @@ async def test_unauthorized_agent_destructive_tool_calls_blocked() -> None:
     task_agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
     res2 = await task_agent.run("Delete note xyz.")
 
-    assert res2.is_success is True
+    assert res2.is_success is False
     assert res2.tool_calls[0].is_error is True
     assert (
         "Permission denied: Tool 'delete_note' is not permitted for Task Agent"
         in str(res2.tool_calls[0].result)
     )
     mock_host.invoke_tool.assert_not_called()
+
+
+def test_property_permits_null() -> None:
+    """Verify property_permits_null correctly identifies nullable schema definitions."""
+    # Direct type null
+    assert property_permits_null({"type": "null"}) is True
+    assert property_permits_null({"type": ["string", "null"]}) is True
+    assert property_permits_null({"type": "string"}) is False
+
+    # anyOf
+    assert (
+        property_permits_null({"anyOf": [{"type": "string"}, {"type": "null"}]}) is True
+    )
+    assert (
+        property_permits_null(
+            {
+                "anyOf": [
+                    {"type": "object", "additionalProperties": True},
+                    {"type": "null"},
+                ]
+            }
+        )
+        is True
+    )
+    assert (
+        property_permits_null({"anyOf": [{"type": "string"}, {"type": "integer"}]})
+        is False
+    )
+
+    # oneOf
+    assert (
+        property_permits_null({"oneOf": [{"type": "string"}, {"type": "null"}]}) is True
+    )
+
+    # allOf
+    assert (
+        property_permits_null({"allOf": [{"type": "string"}, {"type": "null"}]}) is True
+    )
+
+    # non-dict or empty
+    assert property_permits_null({}) is False
+    assert property_permits_null(None) is False  # type: ignore[arg-type]
+
+
+def test_evaluate_tool_records_success() -> None:
+    """Verify evaluate_tool_records_success identifies successes, unrecovered failures, and retries."""
+    # 1. Empty records
+    ok, err = evaluate_tool_records_success([])
+    assert ok is True
+    assert err is None
+
+    # 2. All succeeded
+    rec1 = ToolCallRecord(
+        tool_name="get_task", arguments={}, result={"id": "1"}, is_error=False
+    )
+    rec2 = ToolCallRecord(
+        tool_name="list_files", arguments={}, result=[], is_error=False
+    )
+    ok, err = evaluate_tool_records_success([rec1, rec2])
+    assert ok is True
+    assert err is None
+
+    # 3. Last tool failed
+    rec_err = ToolCallRecord(
+        tool_name="create_task",
+        arguments={},
+        result={"error": "Schema failure"},
+        is_error=True,
+    )
+    ok, err = evaluate_tool_records_success([rec1, rec_err])
+    assert ok is False
+    assert "Tool 'create_task' failed" in str(err)
+
+    # 4. Failed tool subsequently recovered by successful retry
+    rec_retry_ok = ToolCallRecord(
+        tool_name="create_task",
+        arguments={"title": "Retry Title"},
+        result={"id": "1", "title": "Retry Title"},
+        is_error=False,
+    )
+    ok, err = evaluate_tool_records_success([rec_err, rec_retry_ok])
+    assert ok is True
+    assert err is None
+
+    # 5. Failed tool followed by different tool succeeding (original tool unrecovered)
+    ok, err = evaluate_tool_records_success([rec_err, rec2])
+    assert ok is False
+    assert "Tool(s) failed without recovery: create_task" in str(err)
+
+
+def test_validate_tool_call_normalizes_null_for_nullable_fields() -> None:
+    """Verify validate_tool_call normalizes string 'null' ONLY for nullable fields."""
+    discovered_schemas = {
+        "create_task": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "priority": {"type": "string", "default": "medium"},
+                "status": {"type": "string", "default": "pending"},
+                "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "assigned_to": {
+                    "anyOf": [
+                        {"type": "object", "additionalProperties": True},
+                        {"type": "null"},
+                    ]
+                },
+                "due_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "dependencies": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ]
+                },
+            },
+            "required": ["title"],
+        }
+    }
+
+    raw_args = {
+        "title": "Learn MCP architecture",
+        "priority": "high",
+        "status": "pending",
+        "description": "null",
+        "assigned_to": "null",
+        "due_date": "null",
+        "dependencies": "null",
+    }
+
+    is_valid, err, cleaned = validate_tool_call(
+        tool_name="create_task",
+        arguments=raw_args,
+        user_prompt='Create a task titled "Learn MCP architecture" with high priority.',
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+
+    assert is_valid is True
+    assert err is None
+    assert cleaned["title"] == "Learn MCP architecture"
+    assert cleaned["priority"] == "high"
+    assert cleaned["status"] == "pending"
+    assert cleaned["description"] is None
+    assert cleaned["assigned_to"] is None
+    assert cleaned["due_date"] is None
+    assert cleaned["dependencies"] is None
+
+
+def test_validate_tool_call_preserves_legitimate_string_null() -> None:
+    """Verify legitimate string 'null' for a non-nullable field is NOT normalized."""
+    discovered_schemas = {
+        "create_task": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "priority": {"type": "string", "default": "medium"},
+            },
+            "required": ["title"],
+        }
+    }
+
+    # User explicitly titled the task "null"
+    raw_args = {"title": "null", "priority": "high"}
+
+    is_valid, err, cleaned = validate_tool_call(
+        tool_name="create_task",
+        arguments=raw_args,
+        user_prompt='Create a task titled "null".',
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+
+    assert is_valid is True
+    assert err is None
+    # title is preserved as string "null", not normalized to None!
+    assert cleaned["title"] == "null"
+    assert cleaned["priority"] == "high"
+
+
+def test_validate_tool_call_all_optional_fields_populated() -> None:
+    """Verify tool call validation preserves all populated legitimate values."""
+    discovered_schemas = {
+        "create_task": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "priority": {"type": "string", "default": "medium"},
+                "status": {"type": "string", "default": "pending"},
+                "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "assigned_to": {
+                    "anyOf": [
+                        {"type": "object", "additionalProperties": True},
+                        {"type": "null"},
+                    ]
+                },
+                "due_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "dependencies": {
+                    "anyOf": [
+                        {"type": "array", "items": {"type": "string"}},
+                        {"type": "null"},
+                    ]
+                },
+            },
+            "required": ["title"],
+        }
+    }
+
+    raw_args = {
+        "title": "Complete Project",
+        "description": "Full writeup",
+        "status": "in_progress",
+        "priority": "critical",
+        "assigned_to": {
+            "type": "agent",
+            "id": "123e4567-e89b-12d3-a456-426614174000",
+        },
+        "due_date": "2026-11-01T12:00:00Z",
+        "dependencies": ["223e4567-e89b-12d3-a456-426614174000"],
+    }
+
+    is_valid, err, cleaned = validate_tool_call(
+        tool_name="create_task",
+        arguments=raw_args,
+        user_prompt="Create task Complete Project",
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+
+    assert is_valid is True
+    assert err is None
+    assert cleaned == raw_args
+
+
+def test_validate_tool_call_explicit_null() -> None:
+    """Verify tool call with explicit Python None/null values succeeds."""
+    discovered_schemas = {
+        "create_task": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                "assigned_to": {
+                    "anyOf": [
+                        {"type": "object", "additionalProperties": True},
+                        {"type": "null"},
+                    ]
+                },
+            },
+            "required": ["title"],
+        }
+    }
+
+    raw_args = {
+        "title": "Explicit Null Test",
+        "description": None,
+        "assigned_to": None,
+    }
+
+    is_valid, err, cleaned = validate_tool_call(
+        tool_name="create_task",
+        arguments=raw_args,
+        user_prompt="Create task",
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+
+    assert is_valid is True
+    assert err is None
+    assert cleaned["description"] is None
+    assert cleaned["assigned_to"] is None
+
+
+def test_validate_tool_call_invalid_arguments_rejected() -> None:
+    """Verify malformed arguments and missing required properties are rejected."""
+    discovered_schemas = {
+        "create_task": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string"},
+                "priority": {"type": "string"},
+            },
+            "required": ["title"],
+        }
+    }
+
+    # 1. Non-dict arguments
+    is_valid, err, _ = validate_tool_call(
+        tool_name="create_task",
+        arguments="not-a-dict",
+        user_prompt="Create task",
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+    assert is_valid is False
+    assert "expected a JSON object" in str(err)
+
+    # 2. Missing required property title
+    is_valid, err, _ = validate_tool_call(
+        tool_name="create_task",
+        arguments={"priority": "high"},
+        user_prompt="Create task",
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+    assert is_valid is False
+    assert "'title' is a required property" in str(err)
+
+    # 3. Invalid property type (number instead of string)
+    is_valid, err, _ = validate_tool_call(
+        tool_name="create_task",
+        arguments={"title": "Test", "priority": 12345},
+        user_prompt="Create task",
+        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
+        discovered_schemas=discovered_schemas,
+        agent_name="Task Agent",
+    )
+    assert is_valid is False
+    assert "12345 is not of type 'string'" in str(err)
+
+
+async def test_agent_reports_failure_when_tool_call_fails() -> None:
+    """Confirm that failed tool calls are not reported as successful."""
+    mock_host = MagicMock(spec=MCPHost)
+    mock_host.discover_tools = AsyncMock(
+        return_value=[
+            ToolDescriptor(
+                name="create_task",
+                description="Create a task",
+                input_schema={
+                    "type": "object",
+                    "properties": {"title": {"type": "string"}},
+                    "required": ["title"],
+                },
+            )
+        ]
+    )
+    # MCP tool returns an error payload
+    mock_host.invoke_tool = AsyncMock(
+        return_value=ToolExecutionResult(
+            tool_name="create_task",
+            is_error=True,
+            data={"error": "Database constraint violation"},
+        )
+    )
+
+    mock_ollama = MagicMock(spec=OllamaService)
+
+    # Turn 1: Model calls create_task
+    turn1_msg = MagicMock()
+    tc1 = MagicMock()
+    tc1.function.name = "create_task"
+    tc1.function.arguments = {"title": "Task A"}
+    turn1_msg.tool_calls = [tc1]
+    turn1_msg.content = None
+
+    # Turn 2: Model finishes with text (without retrying)
+    turn2_msg = MagicMock()
+    turn2_msg.tool_calls = None
+    turn2_msg.content = (
+        "I could not create the task due to a database constraint violation."
+    )
+
+    mock_ollama.chat = AsyncMock(
+        side_effect=[
+            MagicMock(message=turn1_msg),
+            MagicMock(message=turn2_msg),
+        ]
+    )
+
+    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    res = await agent.run("Create task A")
+
+    # The agent MUST report failure, NOT success!
+    assert res.is_success is False
+    assert "failed" in str(res.error).lower()
+    assert res.tool_calls[0].is_error is True
+    assert "Database constraint violation" in str(res.tool_calls[0].result)
+
+
+async def test_agent_task_creation_with_only_title_and_priority_e2e_mock() -> None:
+    """Test task creation with only title and priority where LLM outputs string 'null' for optional fields."""
+    mock_host = MagicMock(spec=MCPHost)
+    mock_host.discover_tools = AsyncMock(
+        return_value=[
+            ToolDescriptor(
+                name="create_task",
+                description="Create a task",
+                input_schema={
+                    "type": "object",
+                    "properties": {
+                        "title": {"type": "string"},
+                        "priority": {"type": "string", "default": "medium"},
+                        "status": {"type": "string", "default": "pending"},
+                        "description": {
+                            "anyOf": [{"type": "string"}, {"type": "null"}]
+                        },
+                        "assigned_to": {
+                            "anyOf": [
+                                {
+                                    "type": "object",
+                                    "additionalProperties": True,
+                                },
+                                {"type": "null"},
+                            ]
+                        },
+                        "due_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
+                    },
+                    "required": ["title"],
+                },
+            )
+        ]
+    )
+
+    # MCP tool succeeds when given cleaned arguments
+    mock_host.invoke_tool = AsyncMock(
+        return_value=ToolExecutionResult(
+            tool_name="create_task",
+            is_error=False,
+            data={
+                "id": "123e4567-e89b-12d3-a456-426614174000",
+                "title": "Learn MCP architecture",
+                "priority": "high",
+                "status": "pending",
+                "description": None,
+                "assigned_to": None,
+                "due_date": None,
+            },
+        )
+    )
+
+    mock_ollama = MagicMock(spec=OllamaService)
+
+    # Turn 1: Model generates the exact problematic payload with "null" strings
+    turn1_msg = MagicMock()
+    tc1 = MagicMock()
+    tc1.function.name = "create_task"
+    tc1.function.arguments = {
+        "title": "Learn MCP architecture",
+        "priority": "high",
+        "status": "pending",
+        "description": "null",
+        "assigned_to": "null",
+        "due_date": "null",
+    }
+    turn1_msg.tool_calls = [tc1]
+    turn1_msg.content = None
+
+    # Turn 2: Model finishes with confirmed success text
+    turn2_msg = MagicMock()
+    turn2_msg.tool_calls = None
+    turn2_msg.content = (
+        'Task "Learn MCP architecture" created successfully with high priority.'
+    )
+
+    mock_ollama.chat = AsyncMock(
+        side_effect=[
+            MagicMock(message=turn1_msg),
+            MagicMock(message=turn2_msg),
+        ]
+    )
+
+    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    res = await agent.run(
+        'Create a task titled "Learn MCP architecture" with high priority.'
+    )
+
+    assert res.is_success is True
+    assert len(res.tool_calls) == 1
+    assert res.tool_calls[0].is_error is False
+
+    # Verify MCPHost was invoked with cleaned arguments where "null" strings became None
+    mock_host.invoke_tool.assert_called_once_with(
+        name="create_task",
+        arguments={
+            "title": "Learn MCP architecture",
+            "priority": "high",
+            "status": "pending",
+            "description": None,
+            "assigned_to": None,
+            "due_date": None,
+        },
+        raise_on_error=False,
+    )

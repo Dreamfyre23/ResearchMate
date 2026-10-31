@@ -28,7 +28,7 @@ from mas.ollama.exceptions import (
 
 def test_ollama_settings_defaults() -> None:
     """Verify default Ollama settings match DEC-009 requirements."""
-    settings = OllamaSettings()
+    settings = OllamaSettings(_env_file=None)
     assert settings.base_url == "http://localhost:11434"
     assert settings.model == "llama3.2:3b"
     assert settings.timeout_seconds == 60.0

@@ -87,7 +87,12 @@ async def test_research_agent_real_inference_and_tool_call(
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        agent = ResearchAgent(mcp_host=host)
+        # Provide adequate timeout for local CPU inference on 8GB RAM development machine
+        from mas.config.settings import OllamaSettings
+        from mas.ollama.client import OllamaService
+
+        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=180.0))
+        agent = ResearchAgent(mcp_host=host, ollama_service=ollama_service)
 
         res = await agent.run(
             "Please list all files in the documents workspace folder."
@@ -113,7 +118,7 @@ async def test_task_agent_real_inference_and_tool_call(
         from mas.config.settings import OllamaSettings
         from mas.ollama.client import OllamaService
 
-        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=120.0))
+        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=180.0))
         agent = TaskAgent(mcp_host=host, ollama_service=ollama_service)
 
         res = await agent.run("List the first 2 tasks currently in the system.")
@@ -136,7 +141,11 @@ async def test_task_agent_create_task_inference(
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        agent = TaskAgent(mcp_host=host)
+        from mas.config.settings import OllamaSettings
+        from mas.ollama.client import OllamaService
+
+        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=180.0))
+        agent = TaskAgent(mcp_host=host, ollama_service=ollama_service)
 
         res = await agent.run(
             "Create a new task with title 'Draft Methodology Section' and high priority."
@@ -184,7 +193,7 @@ async def test_agent_schema_validation_against_real_mcp_server(
         agent = TaskAgent(mcp_host=host, ollama_service=mock_ollama)
         res = await agent.run("Show tasks")
 
-        assert res.is_success is True
+        assert res.is_success is False
         assert len(res.tool_calls) == 1
         assert res.tool_calls[0].is_error is True
         assert "is not of type 'integer'" in str(res.tool_calls[0].result)
@@ -222,7 +231,7 @@ async def test_agent_destructive_intent_safeguard_against_real_mcp_server(
         agent = TaskAgent(mcp_host=host, ollama_service=mock_ollama)
         res = await agent.run("Tell me about task 00000000-0000-0000-0000-000000000000")
 
-        assert res.is_success is True
+        assert res.is_success is False
         assert len(res.tool_calls) == 1
         assert res.tool_calls[0].is_error is True
         assert "Destructive operation 'delete_task' was blocked" in str(
@@ -238,19 +247,24 @@ async def test_agent_destructive_intent_safeguard_allows_authorized_deletion_aga
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
+        # Create an actual task on the real MCP server first
+        create_res = await host.invoke_tool("create_task", {"title": "Task To Delete"})
+        assert create_res.is_error is False
+        task_id = create_res.data["task_id"]
+
         mock_ollama = MagicMock(spec=OllamaService)
 
         # Authorized prompt: explicit instruction and identifiable target
         turn1_msg = MagicMock()
         tc1 = MagicMock()
         tc1.function.name = "delete_task"
-        tc1.function.arguments = {"task_id": "00000000-0000-0000-0000-000000000000"}
+        tc1.function.arguments = {"task_id": task_id}
         turn1_msg.tool_calls = [tc1]
         turn1_msg.content = None
 
         turn2_msg = MagicMock()
         turn2_msg.tool_calls = None
-        turn2_msg.content = "Attempted task deletion on MCP server."
+        turn2_msg.content = f"Deleted task {task_id} on MCP server."
 
         mock_ollama.chat = AsyncMock(
             side_effect=[
@@ -260,13 +274,10 @@ async def test_agent_destructive_intent_safeguard_allows_authorized_deletion_aga
         )
 
         agent = TaskAgent(mcp_host=host, ollama_service=mock_ollama)
-        res = await agent.run(
-            "Please delete task 00000000-0000-0000-0000-000000000000."
-        )
+        res = await agent.run(f"Please delete task {task_id}.")
 
         assert res.is_success is True
         assert len(res.tool_calls) == 1
-        # The tool was NOT blocked locally by destructive guard; it reached the real MCP server
-        assert "Destructive operation 'delete_task' was blocked" not in str(
-            res.tool_calls[0].result
-        )
+        assert res.tool_calls[0].is_error is False
+        assert res.tool_calls[0].result.get("success") is True
+        assert res.tool_calls[0].result.get("task_id") == task_id

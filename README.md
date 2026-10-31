@@ -172,6 +172,22 @@ ResearchMate is engineered to run reliably on resource-constrained development m
 - **Bounded Tool Limits:** File searches and directory listings are bounded (maximum 200–1000 items) to prevent large payload memory spikes.
 - **Connection Pools & Cleanup:** PostgreSQL connection pool is sized to 5 connections with clean context-manager disposal. `MCPHost` leverages `AsyncExitStack` for clean transport disconnection.
 
+### Multi-Model Gemini Fallback System
+The central orchestrator implements a resilient, multi-model fallback mechanism for request planning and response synthesis:
+- **Prioritized Model Hierarchy:** Configured via `.env`:
+  ```env
+  GEMINI_PRIMARY_MODEL=gemini-3.5-flash-lite
+  GEMINI_FALLBACK_MODELS=gemini-3.6-flash,gemini-3.8-flash,gemini-2.5-flash
+  GEMINI_MODEL_RETRY_ATTEMPTS=1
+  GEMINI_MODEL_RETRY_DELAY=0.5
+  ```
+- **Error Classification & Bounded Retries:**
+  - `DAILY_QUOTA_EXHAUSTED` (429 daily quota): Switches immediately to the next fallback model without latency delay, recording the exhausted model in cooldown for subsequent turns.
+  - `OVERLOADED_503`, `TIMEOUT`, `SERVER_ERROR_5XX`: Performs a bounded retry (1 attempt) before transitioning to the next candidate model.
+  - `INVALID_REQUEST_400`, `AUTH_ERROR_401_403`: Terminate candidate evaluation immediately without futile fallback calls.
+- **Deterministic Heuristic Fallback:** If all configured Gemini models are exhausted or unavailable, planning and synthesis seamlessly revert to deterministic rule-based processing without crashing.
+- **Preservation of Agent Results:** Synthesis failures never trigger agent re-execution; collected findings from local specialist agents remain preserved.
+
 ---
 
 ## 7. Independent Component Execution (DEC-024)

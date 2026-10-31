@@ -11,7 +11,7 @@ from typing import Any
 from client_mcp.host import MCPHost
 from client_mcp.models import ToolDescriptor
 from mas.agents.models import AgentRequest, AgentResponse, ToolCallRecord
-from mas.agents.validator import validate_tool_call
+from mas.agents.validator import evaluate_tool_records_success, validate_tool_call
 from mas.config.settings import AgentSettings, get_agent_settings
 from mas.ollama.client import OllamaService
 from mas.ollama.exceptions import OllamaError
@@ -110,12 +110,14 @@ class BaseAgent:
                 # Check if the model produced tool calls or final answer
                 if not tool_calls:
                     final_content = response_message.content or ""
+                    is_success, eval_err = evaluate_tool_records_success(tool_records)
                     return AgentResponse(
                         agent_name=self.agent_name,
                         content=final_content,
                         tool_calls=tool_records,
                         iterations=iteration,
-                        is_success=True,
+                        is_success=is_success,
+                        error=eval_err,
                     )
 
                 # Append assistant message with tool calls to history
@@ -143,7 +145,12 @@ class BaseAgent:
                             func_name,
                             validation_err,
                         )
-                        tool_result: Any = {"error": validation_err}
+                        feedback_msg = (
+                            f"Validation error for tool '{func_name}': {validation_err}. "
+                            "Please correct the arguments and retry. Remember that optional nullable parameters "
+                            "should be JSON null (null without quotes) or omitted, never the string 'null'."
+                        )
+                        tool_result: Any = {"error": feedback_msg}
                         is_err = True
                         recorded_args = (
                             cleaned_args

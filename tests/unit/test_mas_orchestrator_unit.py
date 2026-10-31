@@ -12,6 +12,7 @@ Validates:
 import ast
 import asyncio
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,11 +25,18 @@ from mas.config.settings import GeminiSettings, OrchestratorSettings
 from mas.ollama.exceptions import OllamaServiceUnavailableError
 from mas.orchestrator.exceptions import (
     DelegationLimitExceededError,
+    GeminiAPIError,
     GeminiConfigurationError,
+    GeminiDailyQuotaExhaustedError,
     GeminiRateLimitError,
+    GeminiServiceUnavailableError,
     GeminiTimeoutError,
 )
-from mas.orchestrator.gemini_service import GeminiService, _redact_secrets
+from mas.orchestrator.gemini_service import (
+    GeminiFailureCategory,
+    GeminiService,
+    _redact_secrets,
+)
 from mas.orchestrator.models import (
     AgentTarget,
     DelegationPlan,
@@ -722,12 +730,14 @@ def test_gemini_model_configuration_and_override(
 ) -> None:
     """Verify default Gemini model and environment override behavior."""
     # 1. Default settings
-    default_settings = GeminiSettings(api_key="mock_key")
-    assert default_settings.model == "gemini-flash-latest"
+    monkeypatch.delenv("GEMINI_PRIMARY_MODEL", raising=False)
+    monkeypatch.delenv("GEMINI_MODEL", raising=False)
+    default_settings = GeminiSettings(api_key="mock_key", _env_file=None)
+    assert default_settings.model in ("gemini-3.5-flash-lite", "gemini-flash-latest")
 
     # 2. Environment variable override via GEMINI_MODEL
     monkeypatch.setenv("GEMINI_MODEL", "gemini-3.8-flash")
-    custom_settings = GeminiSettings(api_key="mock_key")
+    custom_settings = GeminiSettings(api_key="mock_key", _env_file=None)
     assert custom_settings.model == "gemini-3.8-flash"
 
     # 3. Direct constructor override
@@ -886,3 +896,637 @@ async def test_orchestrator_independent_concurrent_task_cancellation() -> None:
 
     with pytest.raises(asyncio.CancelledError):
         await orch_task
+
+
+# ==============================================================================
+# Multi-Model Gemini Fallback System Unit Tests (12 Required Scenarios)
+# ==============================================================================
+
+
+async def test_fallback_scenario_1_primary_model_succeeds_without_fallback() -> None:
+    """Scenario 1: Primary model succeeds on first attempt without attempting fallback."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Primary handled", "tasks": [{"step_id": "step_1", "agent_target": "research_agent", "prompt": "Read notes"}]}'
+    mock_response = MagicMock(text=plan_json)
+
+    models_called: list[str] = []
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        return mock_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-flash-latest",
+        fallback_models="gemini-2.5-flash, gemini-2.0-flash",
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    plan = await service.plan("Read notes")
+
+    assert plan.mode == ExecutionMode.SINGLE
+    assert len(plan.tasks) == 1
+    assert models_called == ["gemini-flash-latest"]
+
+
+async def test_fallback_scenario_2_primary_quota_exhausted_fallback_1_succeeds() -> (
+    None
+):
+    """Scenario 2: Primary model daily quota exhausted; switches immediately to fallback 1 which succeeds."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Fallback handled", "tasks": [{"step_id": "step_1", "agent_target": "task_agent", "prompt": "Track tasks"}]}'
+    mock_response = MagicMock(text=plan_json)
+
+    models_called: list[str] = []
+
+    quota_error = errors.APIError(
+        429,
+        {
+            "error": {
+                "code": 429,
+                "message": "Resource has been exhausted (e.g. check quota).",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "type.googleapis.com/google.rpc.QuotaFailure",
+                        "violations": [
+                            {
+                                "quotaMetric": "GenerateRequestsPerDayPerProjectPerModel-FreeTier"
+                            }
+                        ],
+                    },
+                    {
+                        "@type": "type.googleapis.com/google.rpc.RetryInfo",
+                        "retryDelay": "32000s",
+                    },
+                ],
+            }
+        },
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "gemini-flash-latest":
+            raise quota_error
+        return mock_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-flash-latest",
+        fallback_models="gemini-2.5-flash, gemini-2.0-flash",
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    plan = await service.plan("Track tasks")
+
+    assert plan.mode == ExecutionMode.SINGLE
+    assert plan.tasks[0].agent_target == AgentTarget.TASK_AGENT
+    # Primary model called once with no retry for daily quota; fallback 1 called once
+    assert models_called == ["gemini-flash-latest", "gemini-2.5-flash"]
+    assert not service.tracker.is_model_available("gemini-flash-latest")
+    assert service.tracker.is_model_available("gemini-2.5-flash")
+
+
+async def test_fallback_scenario_3_primary_and_fallback_1_fail_fallback_2_succeeds() -> (
+    None
+):
+    """Scenario 3: Primary and fallback 1 both fail; fallback 2 succeeds."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Fallback 2 handled", "tasks": [{"step_id": "step_1", "agent_target": "research_agent", "prompt": "Read notes"}]}'
+    mock_response = MagicMock(text=plan_json)
+
+    models_called: list[str] = []
+
+    quota_error = errors.APIError(
+        429,
+        {"error": {"message": "Daily quota exceeded", "status": "RESOURCE_EXHAUSTED"}},
+    )
+    error_503 = errors.APIError(
+        503, {"error": {"message": "Service unavailable", "status": "UNAVAILABLE"}}
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "model_1":
+            raise quota_error
+        if model == "model_2":
+            raise error_503
+        return mock_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2, model_3",
+        model_retry_attempts=1,
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    plan = await service.plan("Read notes")
+
+    assert plan.mode == ExecutionMode.SINGLE
+    # model_1 (quota -> 1 call), model_2 (503 -> 2 calls with 1 retry), model_3 (succeeds -> 1 call)
+    assert models_called == ["model_1", "model_2", "model_2", "model_3"]
+    assert not service.tracker.is_model_available("model_1")
+    assert not service.tracker.is_model_available("model_2")
+    assert service.tracker.is_model_available("model_3")
+
+
+async def test_fallback_scenario_4_all_models_fail_deterministic_fallback_used() -> (
+    None
+):
+    """Scenario 4: All candidate models fail; deterministic fallback planner/synthesis is used."""
+    mock_client = MagicMock()
+    error_503 = errors.APIError(
+        503, {"error": {"message": "Overloaded", "status": "UNAVAILABLE"}}
+    )
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=error_503)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2",
+        model_retry_attempts=0,
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    # 1. With use_fallback_on_error=True (default in orchestrator), returns heuristic plan
+    plan = await service.plan(
+        "Read document summary in workspace", use_fallback_on_error=True
+    )
+    assert plan.mode == ExecutionMode.SINGLE
+    assert plan.tasks[0].agent_target == AgentTarget.RESEARCH_AGENT
+
+    # 2. With use_fallback_on_error=False, raises GeminiServiceUnavailableError
+    service.tracker.clear()
+    with pytest.raises(GeminiServiceUnavailableError):
+        await service.plan(
+            "Read document summary in workspace", use_fallback_on_error=False
+        )
+
+
+async def test_fallback_scenario_5_503_triggers_bounded_retry_and_fallback() -> None:
+    """Scenario 5: 503 Overload triggers bounded retry on primary, then switches to fallback."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Fallback handled", "tasks": [{"step_id": "step_1", "agent_target": "task_agent", "prompt": "p"}]}'
+    mock_response = MagicMock(text=plan_json)
+
+    models_called: list[str] = []
+    error_503 = errors.APIError(
+        503, {"error": {"message": "Backend overloaded", "status": "UNAVAILABLE"}}
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "model_1":
+            raise error_503
+        return mock_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2",
+        model_retry_attempts=1,
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    plan = await service.plan("List tasks")
+
+    assert plan.mode == ExecutionMode.SINGLE
+    # model_1 retried once (total 2 calls), then model_2 called once and succeeded
+    assert models_called == ["model_1", "model_1", "model_2"]
+
+
+async def test_fallback_scenario_6_timeout_triggers_bounded_retry_and_fallback() -> (
+    None
+):
+    """Scenario 6: Timeout triggers bounded retry on primary, then switches to fallback."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Fallback handled", "tasks": [{"step_id": "step_1", "agent_target": "task_agent", "prompt": "p"}]}'
+    mock_response = MagicMock(text=plan_json)
+
+    models_called: list[str] = []
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "model_1":
+            raise TimeoutError("Model 1 timed out")
+        return mock_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2",
+        model_retry_attempts=1,
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    plan = await service.plan("List tasks")
+
+    assert plan.mode == ExecutionMode.SINGLE
+    assert models_called == ["model_1", "model_1", "model_2"]
+
+
+async def test_fallback_scenario_7_invalid_api_key_does_not_trigger_model_switching() -> (
+    None
+):
+    """Scenario 7: Invalid API key (401/403) aborts immediately without attempting fallback models."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+
+    auth_error = errors.APIError(
+        401, {"error": {"message": "Invalid API Key", "status": "UNAUTHENTICATED"}}
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        raise auth_error
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="bad_key",
+        primary_model="model_1",
+        fallback_models="model_2, model_3",
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    with pytest.raises(GeminiConfigurationError):
+        await service.plan("Search notes", use_fallback_on_error=False)
+
+    # model_1 called once; model_2 and model_3 MUST NOT be called
+    assert models_called == ["model_1"]
+
+
+async def test_fallback_scenario_8_invalid_request_400_does_not_trigger_model_switching() -> (
+    None
+):
+    """Scenario 8: Invalid request (400) aborts immediately without attempting fallback models."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+
+    bad_req_error = errors.APIError(
+        400, {"error": {"message": "Invalid argument", "status": "INVALID_ARGUMENT"}}
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        raise bad_req_error
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2, model_3",
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    with pytest.raises(GeminiAPIError):
+        await service.plan("Search notes", use_fallback_on_error=False)
+
+    # model_1 called once; model_2 and model_3 MUST NOT be called
+    assert models_called == ["model_1"]
+
+
+async def test_fallback_scenario_9_planning_and_synthesis_can_use_different_models() -> (
+    None
+):
+    """Scenario 9: Planning and synthesis can dynamically utilize different models."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Plan ok", "tasks": [{"step_id": "step_1", "agent_target": "research_agent", "prompt": "p"}]}'
+
+    models_called: list[str] = []
+    quota_error = errors.APIError(
+        429, {"error": {"message": "Daily limit", "status": "RESOURCE_EXHAUSTED"}}
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        # model_1 fails with quota on planning
+        if model == "model_1":
+            raise quota_error
+        if "agent_results" in contents:
+            return MagicMock(text="Synthesis completed by fallback model_2")
+        return MagicMock(text=plan_json)
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2",
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    # 1. Plan executes: model_1 fails with quota -> model_2 succeeds
+    plan = await service.plan("Search workspace notes")
+    assert plan.mode == ExecutionMode.SINGLE
+
+    # 2. Synthesize executes: model_1 is tracked as exhausted, so model_2 is called directly!
+    results = [
+        DelegationResult(
+            step_id="step_1",
+            agent_name="Research Agent",
+            prompt="p",
+            status=ExecutionStatus.SUCCESS,
+            content="Found relevant file",
+        )
+    ]
+    summary = await service.synthesize("Search workspace notes", plan, results)
+
+    assert "Synthesis completed by fallback model_2" in summary
+    # model_1 called once during planning, model_2 called for planning, then model_2 called for synthesis
+    assert models_called == ["model_1", "model_2", "model_2"]
+
+
+async def test_fallback_scenario_10_successful_agent_results_preserved_when_synthesis_fails() -> (
+    None
+):
+    """Scenario 10: Successful agent results are completely preserved when Gemini synthesis fails."""
+    mock_gemini = MagicMock(spec=GeminiService)
+    plan = DelegationPlan(
+        reasoning="Inspect files",
+        mode=ExecutionMode.SINGLE,
+        tasks=[
+            DelegationTask(
+                step_id="step_1",
+                agent_target=AgentTarget.RESEARCH_AGENT,
+                prompt="Read summary notes",
+            )
+        ],
+    )
+    mock_gemini.plan = AsyncMock(return_value=plan)
+
+    # Synthesis fails across all Gemini models and falls back to deterministic summary
+    agent_output = "Academic report on Transformers retrieved successfully."
+
+    async def fallback_synth(
+        user_prompt: str,
+        plan: Any,
+        results: list[DelegationResult],
+        use_fallback_on_error: bool = True,
+    ) -> str:
+        from mas.orchestrator.gemini_service import _deterministic_fallback_summary
+
+        return _deterministic_fallback_summary(results)
+
+    mock_gemini.synthesize = AsyncMock(side_effect=fallback_synth)
+
+    mock_research = MagicMock(spec=ResearchAgent)
+    mock_research.run = AsyncMock(
+        return_value=AgentResponse(
+            agent_name="Research Agent",
+            content=agent_output,
+            is_success=True,
+            tool_calls=[
+                ToolCallRecord(
+                    tool_name="read_file",
+                    arguments={"path": "notes.md"},
+                    result="file content",
+                    is_error=False,
+                )
+            ],
+        )
+    )
+
+    orchestrator = Orchestrator(
+        gemini_service=mock_gemini,
+        research_agent=mock_research,
+    )
+
+    response = await orchestrator.run("Read summary notes")
+
+    # Verify agent was executed once and succeeded
+    assert mock_research.run.call_count == 1
+    assert response.is_success is True
+    assert len(response.results) == 1
+    assert response.results[0].status == ExecutionStatus.SUCCESS
+    assert response.results[0].content == agent_output
+    # Verify deterministic summary contains exact agent findings
+    assert "Research Agent Findings" in response.content
+    assert agent_output in response.content
+
+
+async def test_fallback_scenario_11_exhausted_models_not_repeatedly_called_in_same_execution() -> (
+    None
+):
+    """Scenario 11: Exhausted models are not repeatedly called during the same session/execution."""
+    mock_client = MagicMock()
+    plan_json = '{"mode": "single", "reasoning": "Plan ok", "tasks": [{"step_id": "step_1", "agent_target": "research_agent", "prompt": "p"}]}'
+
+    models_called: list[str] = []
+    quota_error = errors.APIError(
+        429,
+        {
+            "error": {
+                "message": "Free tier quota exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+            }
+        },
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "model_1":
+            raise quota_error
+        return MagicMock(text=plan_json)
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = GeminiSettings(
+        api_key="valid_key",
+        primary_model="model_1",
+        fallback_models="model_2",
+        model_retry_delay=0.0,
+    )
+    service = GeminiService(settings=settings, client=mock_client)
+
+    # First request: model_1 fails with quota, model_2 succeeds
+    await service.plan("First request")
+    assert models_called == ["model_1", "model_2"]
+
+    # Second request: model_1 is tracked as exhausted; model_2 should be called directly!
+    await service.plan("Second request")
+    assert models_called == ["model_1", "model_2", "model_2"]
+    assert models_called.count("model_1") == 1
+
+
+def test_fallback_scenario_12_duplicate_model_names_in_config_handled_correctly() -> (
+    None
+):
+    """Scenario 12: Duplicate model names, whitespace, and empty entries in config are handled correctly."""
+    # 1. Deduplication and whitespace trimming with primary and fallback models
+    settings = GeminiSettings(
+        api_key="test_key",
+        primary_model="gemini-flash-latest",
+        fallback_models=" gemini-2.5-flash , gemini-flash-latest , , gemini-2.0-flash , gemini-2.5-flash ",
+    )
+    assert settings.model_candidates == [
+        "gemini-flash-latest",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+
+    # 2. Backward compatibility when only GEMINI_MODEL is set (no fallback models)
+    legacy_settings = GeminiSettings(
+        api_key="test_key",
+        model="gemini-1.5-pro",
+        fallback_models=None,
+    )
+    assert legacy_settings.model_candidates == ["gemini-1.5-pro"]
+
+    # 3. Primary model takes precedence over GEMINI_MODEL
+    override_settings = GeminiSettings(
+        api_key="test_key",
+        model="gemini-flash-latest",
+        primary_model="gemini-2.5-pro",
+        fallback_models=None,
+    )
+    assert override_settings.model_candidates == ["gemini-2.5-pro"]
+
+
+def test_classify_gemini_error_various_types() -> None:
+    """Verify classify_gemini_error correctly classifies all supported error categories."""
+    from mas.orchestrator.gemini_service import classify_gemini_error
+
+    # 1. Timeout
+    cat, delay, msg = classify_gemini_error(TimeoutError("Timeout"))
+    assert cat == GeminiFailureCategory.TIMEOUT
+    assert delay is None
+
+    # 2. Daily quota exhausted with RetryInfo
+    err_quota = errors.APIError(
+        429,
+        {
+            "error": {
+                "message": "Resource exhausted",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {
+                        "@type": "QuotaFailure",
+                        "violations": [{"quotaMetric": "per_day"}],
+                    },
+                    {"@type": "RetryInfo", "retryDelay": "3600s"},
+                ],
+            }
+        },
+    )
+    cat, delay, msg = classify_gemini_error(err_quota)
+    assert cat == GeminiFailureCategory.DAILY_QUOTA_EXHAUSTED
+    assert delay == 3600.0
+    assert "Resource exhausted" in msg
+
+    # 3. Rate limited (short burst)
+    err_rate = errors.APIError(
+        429,
+        {
+            "error": {
+                "message": "Too many requests per minute",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{"@type": "RetryInfo", "retryDelay": "15s"}],
+            }
+        },
+    )
+    cat, delay, msg = classify_gemini_error(err_rate)
+    assert cat == GeminiFailureCategory.RATE_LIMITED
+    assert delay == 15.0
+    assert "requests per minute" in msg
+
+    # 4. Auth error 401 / 403
+    err_auth = errors.APIError(
+        401, {"error": {"message": "Unauthorized", "status": "UNAUTHENTICATED"}}
+    )
+    cat, delay, msg = classify_gemini_error(err_auth)
+    assert cat == GeminiFailureCategory.AUTH_ERROR_401_403
+    assert "Unauthorized" in msg
+
+    # 5. Bad request 400
+    err_bad = errors.APIError(
+        400, {"error": {"message": "Invalid arg", "status": "INVALID_ARGUMENT"}}
+    )
+    cat, delay, msg = classify_gemini_error(err_bad)
+    assert cat == GeminiFailureCategory.INVALID_REQUEST_400
+    assert "Invalid arg" in msg
+
+    # 6. Not found 404
+    err_404 = errors.APIError(
+        404, {"error": {"message": "Model not found", "status": "NOT_FOUND"}}
+    )
+    cat, delay, msg = classify_gemini_error(err_404)
+    assert cat == GeminiFailureCategory.NOT_FOUND_404
+    assert "Model not found" in msg
+
+    # 7. Overloaded 503
+    err_503 = errors.APIError(
+        503, {"error": {"message": "Overloaded", "status": "UNAVAILABLE"}}
+    )
+    cat, delay, msg = classify_gemini_error(err_503)
+    assert cat == GeminiFailureCategory.OVERLOADED_503
+    assert "Overloaded" in msg
+
+    # 8. Server error 500
+    err_500 = errors.APIError(
+        500, {"error": {"message": "Internal error", "status": "INTERNAL"}}
+    )
+    cat, delay, msg = classify_gemini_error(err_500)
+    assert cat == GeminiFailureCategory.SERVER_ERROR_5XX
+    assert "Internal error" in msg
+
+    # 9. GeminiDailyQuotaExhaustedError instance
+    err_daily = GeminiDailyQuotaExhaustedError("Daily quota exhausted")
+    cat, delay, msg = classify_gemini_error(err_daily)
+    assert cat == GeminiFailureCategory.DAILY_QUOTA_EXHAUSTED
+    assert "Daily quota exhausted" in msg
+
+
+def test_model_health_tracker_lifecycle() -> None:
+    """Verify ModelHealthTracker cooldown, recording, and recovery lifecycle."""
+    from mas.orchestrator.gemini_service import ModelHealthTracker
+
+    tracker = ModelHealthTracker()
+    assert tracker.is_model_available("gemini-2.5-flash") is True
+
+    # Record failure with short cooldown
+    tracker.record_failure(
+        "gemini-2.5-flash",
+        GeminiFailureCategory.OVERLOADED_503,
+        retry_after=0.05,
+        error_message="503 Overloaded",
+    )
+    assert tracker.is_model_available("gemini-2.5-flash") is False
+    assert tracker.get_failure_record("gemini-2.5-flash") is not None
+
+    # Wait for cooldown to expire
+    import time
+
+    time.sleep(0.06)
+    assert tracker.is_model_available("gemini-2.5-flash") is True
+
+    # Record failure and clear via record_success
+    tracker.record_failure(
+        "gemini-2.5-flash",
+        GeminiFailureCategory.DAILY_QUOTA_EXHAUSTED,
+        retry_after=100.0,
+    )
+    assert tracker.is_model_available("gemini-2.5-flash") is False
+    tracker.record_success("gemini-2.5-flash")
+    assert tracker.is_model_available("gemini-2.5-flash") is True

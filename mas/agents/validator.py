@@ -380,6 +380,84 @@ def is_deletion_authorized(
     return False
 
 
+def property_permits_null(prop_def: dict[str, Any]) -> bool:
+    """Determine whether a JSON Schema property definition explicitly permits null.
+
+    Inspects direct type declarations, anyOf, oneOf, and allOf branches.
+    """
+    if not isinstance(prop_def, dict):
+        return False
+
+    # 1. Direct type == "null" or type list containing "null"
+    prop_type = prop_def.get("type")
+    if prop_type == "null":
+        return True
+    if isinstance(prop_type, list) and "null" in prop_type:
+        return True
+
+    # 2. Check anyOf
+    for sub in prop_def.get("anyOf", []):
+        if isinstance(sub, dict):
+            sub_type = sub.get("type")
+            if sub_type == "null" or (
+                isinstance(sub_type, list) and "null" in sub_type
+            ):
+                return True
+
+    # 3. Check oneOf
+    for sub in prop_def.get("oneOf", []):
+        if isinstance(sub, dict):
+            sub_type = sub.get("type")
+            if sub_type == "null" or (
+                isinstance(sub_type, list) and "null" in sub_type
+            ):
+                return True
+
+    # 4. Check allOf
+    for sub in prop_def.get("allOf", []):
+        if isinstance(sub, dict):
+            sub_type = sub.get("type")
+            if sub_type == "null" or (
+                isinstance(sub_type, list) and "null" in sub_type
+            ):
+                return True
+
+    return False
+
+
+def evaluate_tool_records_success(tool_records: list[Any]) -> tuple[bool, str | None]:
+    """Evaluate whether an agent's tool invocations completed successfully.
+
+    Returns:
+        Tuple of (is_success, error_message).
+    """
+    if not tool_records:
+        return True, None
+
+    # If the last tool call was an error, the agent's latest tool action failed
+    if tool_records[-1].is_error:
+        last_err = (
+            tool_records[-1].result.get("error")
+            if isinstance(tool_records[-1].result, dict)
+            else str(tool_records[-1].result)
+        )
+        return False, f"Tool '{tool_records[-1].tool_name}' failed: {last_err}"
+
+    # Track failed tools and ensure every failure was subsequently recovered
+    failed_tools: set[str] = set()
+    for tc in tool_records:
+        if tc.is_error:
+            failed_tools.add(tc.tool_name)
+        else:
+            failed_tools.discard(tc.tool_name)
+
+    if failed_tools:
+        unrecovered = sorted(failed_tools)
+        return False, f"Tool(s) failed without recovery: {', '.join(unrecovered)}"
+
+    return True, None
+
+
 def validate_tool_call(
     tool_name: str,
     arguments: Any,
@@ -446,22 +524,43 @@ def validate_tool_call(
             {},
         )
 
-    # 5. Sanitize arguments (strip None values for optional properties where type is not nullable)
+    # 5. Sanitize arguments (safely normalize "null" string only if schema explicitly permits null)
     schema = discovered_schemas[tool_name]
     properties = schema.get("properties", {})
+    required_props = set(schema.get("required", []))
     cleaned_args: dict[str, Any] = {}
 
     for k, v in arguments.items():
+        prop_def = properties.get(k, {})
+        allows_null = property_permits_null(prop_def)
+
+        # Normalize string "null" or "none" ONLY if the property schema explicitly permits null.
+        # Preserve legitimate string values for non-nullable fields.
+        if isinstance(v, str) and v.strip().lower() in ("null", "none") and allows_null:
+            v = None
+
+        # Safe numeric coercion for integer properties when model produces digit strings
+        prop_type = prop_def.get("type")
+        is_integer_prop = prop_type == "integer" or (
+            isinstance(prop_type, list) and "integer" in prop_type
+        )
+        if is_integer_prop and isinstance(v, str):
+            cleaned_str = v.strip()
+            if cleaned_str.isdigit() or (
+                cleaned_str.startswith("-") and cleaned_str[1:].isdigit()
+            ):
+                v = int(cleaned_str)
+            elif cleaned_str in ("", "null", "none") and k not in required_props:
+                # Omit empty string for optional integer field so default applies
+                continue
+
         if v is None:
-            # If property explicitly allows null in schema, keep it; otherwise omit so default applies
-            prop_def = properties.get(k, {})
-            any_of = prop_def.get("anyOf", [])
-            type_def = prop_def.get("type")
-            allows_null = type_def == "null" or any(
-                sub.get("type") == "null" for sub in any_of
-            )
             if allows_null:
                 cleaned_args[k] = None
+            elif k in required_props:
+                # Retain None so jsonschema flags the type error on required non-nullable field
+                cleaned_args[k] = None
+            # If property does not allow null and is optional, omitting it lets schema default apply
         else:
             cleaned_args[k] = v
 
