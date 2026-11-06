@@ -5,7 +5,7 @@ Validates:
 - Gemini integration: success, error handling, rate limits, timeouts, missing API keys, secret redaction.
 - Agent selection: research-only, task-only, independent multi-agent, sequential multi-agent, unsupported requests.
 - Delegation contracts: single, independent, sequential with upstream context propagation, bounded delegation steps.
-- Failure handling: agent failure, agent timeout, Ollama unavailable, partial failure preservation.
+- Failure handling: agent failure, agent timeout, agent service unavailable, partial failure preservation.
 - Response synthesis: transparent reporting without false claims of completion.
 """
 
@@ -18,11 +18,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 from google.genai import errors
 
+from mas.agents.gemini_agent_service import AgentGeminiServiceUnavailableError
 from mas.agents.models import AgentRequest, AgentResponse, ToolCallRecord
 from mas.agents.research_agent.agent import ResearchAgent
 from mas.agents.task_agent.agent import TaskAgent
 from mas.config.settings import GeminiSettings, OrchestratorSettings
-from mas.ollama.exceptions import OllamaServiceUnavailableError
 from mas.orchestrator.exceptions import (
     DelegationLimitExceededError,
     GeminiAPIError,
@@ -679,8 +679,8 @@ async def test_orchestrator_agent_timeout_handled_gracefully() -> None:
     assert "timed out after 0.05s" in str(res.results[0].error)
 
 
-async def test_orchestrator_handles_ollama_unavailable() -> None:
-    """Verify orchestrator handles Ollama daemon unavailable error without crashing."""
+async def test_orchestrator_handles_agent_service_unavailable() -> None:
+    """Verify orchestrator handles agent service unavailable error without crashing."""
     mock_gemini = MagicMock(spec=GeminiService)
     mock_gemini.plan = AsyncMock(
         return_value=DelegationPlan(
@@ -696,13 +696,13 @@ async def test_orchestrator_handles_ollama_unavailable() -> None:
         )
     )
     mock_gemini.synthesize = AsyncMock(
-        return_value="Execution Failed: Cannot connect to Ollama at localhost:11434"
+        return_value="Execution Failed: Cannot connect to Gemini API for sub-agent"
     )
 
     mock_research = MagicMock(spec=ResearchAgent)
     mock_research.run = AsyncMock(
-        side_effect=OllamaServiceUnavailableError(
-            "Cannot connect to Ollama at localhost:11434"
+        side_effect=AgentGeminiServiceUnavailableError(
+            "Cannot connect to Gemini API for sub-agent"
         )
     )
 
@@ -716,7 +716,7 @@ async def test_orchestrator_handles_ollama_unavailable() -> None:
     assert res.is_success is False
     assert len(res.results) == 1
     assert res.results[0].status == ExecutionStatus.FAILED
-    assert "Cannot connect to Ollama" in str(res.results[0].error)
+    assert "Cannot connect to Gemini API" in str(res.results[0].error)
     assert "Execution Failed" in res.content
 
 

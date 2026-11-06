@@ -106,9 +106,9 @@ All four directories are established within `workspace/`. File Management MCP to
 | Component | Technology |
 |---|---|
 | Orchestrator LLM | Google Gemini API |
-| Research Agent LLM | Llama 3.2 3B through Ollama |
-| Task Agent LLM | Llama 3.2 3B through Ollama |
-| Local LLM runtime | Ollama |
+| Research Agent LLM | Google Gemini API (DEC-033) |
+| Task Agent LLM | Google Gemini API (DEC-033) |
+| Local LLM runtime | Not required (Ollama removed from agent stack — DEC-033) |
 | MCP implementation | Official Python MCP SDK |
 | MCP transport | Streamable HTTP |
 | Database | PostgreSQL |

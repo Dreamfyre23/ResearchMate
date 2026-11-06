@@ -1,7 +1,8 @@
-"""System prompts and instructions for Research Agent (Phase 13).
+"""System prompts and instructions for Research Agent (DEC-033).
 
-Engineered for local Ollama (llama3.2:3b) inference, dynamic MCP schema compliance,
-accurate tool selection, reliable argument construction, and grounded responses.
+Engineered for Google Gemini function-calling inference, dynamic MCP schema
+compliance, accurate tool selection, reliable argument construction, and
+grounded responses.
 """
 
 RESEARCH_AGENT_SYSTEM_PROMPT = """# Role and Objective

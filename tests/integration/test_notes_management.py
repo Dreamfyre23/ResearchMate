@@ -59,8 +59,8 @@ def seeded_agent() -> dict[str, Any]:
             code="NM-AGENT-001",
             role="research",
             description="Agent for testing Notes Management attribution.",
-            model="llama3.2:3b",
-            provider="ollama",
+            model="gemini-3.5-flash-lite",
+            provider="google",
             status="active",
             capabilities=[],
         )

@@ -1,4 +1,4 @@
-"""Unit tests for Phase 11 lifecycle management and pre-flight checks."""
+"""Unit tests for Phase 11 lifecycle management and pre-flight checks (DEC-033)."""
 
 import ast
 from pathlib import Path
@@ -13,11 +13,9 @@ from mas.lifecycle import (
     check_database_status_via_mcp,
     check_gemini_configuration,
     check_mcp_server_health,
-    check_ollama_health,
     ensure_workspace_structure,
     run_preflight_checks,
 )
-from mas.ollama.client import OllamaService
 
 
 def test_mas_phase11_architectural_boundaries() -> None:
@@ -90,30 +88,6 @@ async def test_check_mcp_server_health_failure() -> None:
         assert "Cannot connect" in msg
 
 
-async def test_check_ollama_health_success() -> None:
-    """Verify check_ollama_health succeeds when daemon is healthy and model is available."""
-    mock_service = MagicMock(spec=OllamaService)
-    mock_service.check_health = AsyncMock(return_value=True)
-    mock_service.ensure_model_available = AsyncMock(return_value=True)
-    mock_service.model_name = "llama3.2:3b"
-    mock_service.base_url = "http://localhost:11434"
-
-    ok, msg = await check_ollama_health(mock_service)
-    assert ok is True
-    assert "llama3.2:3b" in msg
-
-
-async def test_check_ollama_health_service_down() -> None:
-    """Verify check_ollama_health reports failure when daemon is unreachable."""
-    mock_service = MagicMock(spec=OllamaService)
-    mock_service.check_health = AsyncMock(return_value=False)
-    mock_service.base_url = "http://localhost:11434"
-
-    ok, msg = await check_ollama_health(mock_service)
-    assert ok is False
-    assert "not responding" in msg
-
-
 def test_check_gemini_configuration_configured(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify Gemini check succeeds when API key is provided."""
     monkeypatch.setenv("GOOGLE_API_KEY", "AIzaSyTestValidKey12345")
@@ -166,17 +140,12 @@ async def test_check_database_status_via_mcp_failure() -> None:
 
 
 async def test_run_preflight_checks_aggregation(tmp_path: Path) -> None:
-    """Verify run_preflight_checks consolidates all service statuses."""
+    """Verify run_preflight_checks consolidates all service statuses (DEC-033: no Ollama)."""
     with (
         patch(
             "mas.lifecycle.check_mcp_server_health",
             new_callable=AsyncMock,
             return_value=(True, "MCP OK"),
-        ),
-        patch(
-            "mas.lifecycle.check_ollama_health",
-            new_callable=AsyncMock,
-            return_value=(True, "Ollama OK"),
         ),
         patch(
             "mas.lifecycle.check_gemini_configuration", return_value=(True, "Gemini OK")
@@ -185,6 +154,7 @@ async def test_run_preflight_checks_aggregation(tmp_path: Path) -> None:
         health = await run_preflight_checks(workspace_root=tmp_path)
         assert health.workspace is True
         assert health.mcp_server is True
-        assert health.ollama is True
         assert health.gemini is True
         assert health.is_operational is True
+        # ollama field is no longer present on ServiceHealth (DEC-033)
+        assert not hasattr(health, "ollama")

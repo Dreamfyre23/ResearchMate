@@ -1,8 +1,8 @@
 # ResearchMate
 
-ResearchMate is a multi-agent AI research assistant designed for students and academic researchers. A central Gemini-powered orchestrator classifies user requests, plans multi-step academic workflows, and delegates subtasks to specialized local agents running on Ollama (`llama3.2:3b`). The agents interact with academic data and local documents through an ecosystem of tools and resources exposed over the Model Context Protocol (MCP) using Streamable HTTP. Relational data is persisted in PostgreSQL, and files are managed within a strictly bounded workspace.
+ResearchMate is a multi-agent AI research assistant designed for students and academic researchers. A central Gemini-powered orchestrator classifies user requests, plans multi-step academic workflows, and delegates subtasks to specialized agents (Research Agent and Task Agent) powered by Google Gemini with native function calling and multi-model fallback (DEC-033). The agents interact with academic data and local documents through an ecosystem of tools and resources exposed over the Model Context Protocol (MCP) using Streamable HTTP. Relational data is persisted in PostgreSQL, and files are managed within a strictly bounded workspace.
 
-**Release Status:** Initial Release (v0.1.0) — Phase 12 (Stabilization and Initial Release) Complete.
+**Release Status:** Initial Release (v0.1.0) — Stabilized and fully migrated to Google Gemini API (DEC-033).
 
 ---
 
@@ -23,8 +23,8 @@ Gemini Orchestrator (mas/orchestrator/)
  │
  ▼
 Specialist Agents (mas/agents/)
- ├── Research Agent -> Local Ollama (llama3.2:3b) -> Notes & Workspace Files
- └── Task Agent     -> Local Ollama (llama3.2:3b) -> Tasks, Deadlines & Agent Info
+ ├── Research Agent -> Google Gemini (gemini-3.5-flash-lite, fallback chain) -> Notes & Workspace Files
+ └── Task Agent     -> Google Gemini (gemini-3.5-flash-lite, fallback chain) -> Tasks, Deadlines & Agent Info
  │
  ▼
 Client-Side MCP Host (client_mcp/host.py)
@@ -64,8 +64,7 @@ logs/          Application logs (git-ignored)
 - **Operating System:** Windows 10/11, macOS, or Linux (optimized for 8 GB RAM laptops)
 - **Python:** 3.15.2 (64-bit)
 - **PostgreSQL:** PostgreSQL 16+ (running on `localhost:5432`)
-- **Ollama:** Ollama daemon running locally with model `llama3.2:3b` pulled
-- **Google Gemini API Key:** `GOOGLE_API_KEY` for orchestrator planning and synthesis
+- **Google Gemini API Key:** A valid `GOOGLE_API_KEY` from [Google AI Studio](https://aistudio.google.com/) for orchestrator planning and sub-agent function calling.
 
 ### Installation Steps
 
@@ -82,7 +81,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 
 # 4. Configure environment variables
-# Copy template and update with your local credentials
+# Copy template and update with your local credentials and API key
 cp .env.example .env
 ```
 
@@ -93,10 +92,35 @@ Create the PostgreSQL database and run Alembic migrations:
 python -m alembic upgrade head
 ```
 
-### Pull Ollama Model
-Verify that the Ollama service is running and download the shared model instance:
-```powershell
-ollama pull llama3.2:3b
+### Environment Configuration (.env)
+Update `.env` with your Google API key, database credentials, and model configurations:
+```env
+GOOGLE_API_KEY=your_actual_api_key_here
+
+# Central Orchestrator Models (Multi-Model Fallback)
+GEMINI_PRIMARY_MODEL=gemini-3.5-flash-lite
+GEMINI_FALLBACK_MODELS=gemini-3.6-flash,gemini-3.8-flash
+GEMINI_TIMEOUT_SECONDS=60.0
+GEMINI_TEMPERATURE=0.2
+GEMINI_MODEL_RETRY_ATTEMPTS=1
+GEMINI_MODEL_RETRY_DELAY=0.5
+
+# Sub-Agents Models (Task Agent & Research Agent)
+AGENT_GEMINI_PRIMARY_MODEL=gemini-3.5-flash-lite
+AGENT_GEMINI_FALLBACK_MODELS=gemini-3.6-flash,gemini-3.8-flash
+AGENT_GEMINI_TIMEOUT_SECONDS=60.0
+AGENT_GEMINI_TEMPERATURE=0.1
+AGENT_GEMINI_MODEL_RETRY_ATTEMPTS=1
+AGENT_GEMINI_MODEL_RETRY_DELAY=0.5
+
+# PostgreSQL Database
+DATABASE_URL=postgresql+psycopg://postgres:your_password@localhost:5432/mas_database
+
+# MCP Server
+MCP_SERVER_HOST=127.0.0.1
+MCP_SERVER_PORT=8000
+MCP_SERVER_URL=http://127.0.0.1:8000/mcp
+WORKSPACE_ROOT=workspace
 ```
 
 ---
@@ -104,7 +128,7 @@ ollama pull llama3.2:3b
 ## 4. Running ResearchMate
 
 ### Pre-Flight System Health Check
-Verify that all system components (PostgreSQL, MCP server, Ollama, Gemini configuration, and workspace) are operational:
+Verify that all system components (PostgreSQL, MCP server, Gemini configuration, and workspace) are operational:
 ```powershell
 python main.py --check
 ```
@@ -112,7 +136,7 @@ python main.py --check
 ### Interactive REPL Mode
 Start ResearchMate in interactive multi-turn conversation mode:
 
-**Option A: Automated Server Management** (spawns background MCP server and terminates it on exit):
+**Option A: Automated Server Management** (automatically starts the background MCP server and shuts it down on exit):
 ```powershell
 python main.py --spawn-server
 ```
@@ -129,7 +153,7 @@ python main.py
 ### CLI Interactive Commands
 Within the interactive REPL:
 - `/help` — Display command list and agent capabilities.
-- `/status` — View real-time status of connected services.
+- `/status` — View real-time status of connected services (PostgreSQL, MCP Server, Gemini API).
 - `/diagnostics` — View MCPHost tool and resource discovery statistics.
 - `/reset` — Clear multi-turn conversation context history.
 - `/quit` or `/exit` — Disconnect cleanly and terminate.
@@ -137,7 +161,7 @@ Within the interactive REPL:
 ### Single-Query Non-Interactive Mode
 Execute a single query directly and return results to standard output:
 ```powershell
-python main.py "List my research tasks"
+python main.py --spawn-server "Find tasks containing the keyword Cryptography"
 ```
 
 ---
@@ -163,30 +187,25 @@ ResearchMate enforces strict defense-in-depth security controls across all layer
 
 ---
 
-## 6. Resource Management & Hardware Optimization (8 GB RAM)
+## 6. Resource Management & Gemini Multi-Model Fallback
 
-ResearchMate is engineered to run reliably on resource-constrained development machines:
-- **Single Ollama Instance:** A single `llama3.2:3b` model instance is shared sequentially or concurrently between agents with `keep_alive=5m` to prevent model thrashing.
-- **Low Model Temperature:** Set to `0.1` for local agents to ensure deterministic tool calling and low inference latency.
+ResearchMate is engineered for low latency, zero hardware bottlenecks, and resilient execution:
+- **Native Gemini Function Calling:** Leverages Google's official `google-genai` SDK for reliable schema compliance, structured query generation, and seamless thought-signature preservation.
+- **Low Model Temperature:** Set to `0.1` for sub-agents to guarantee deterministic, reproducible tool calls.
 - **Bounded Sliding-Window Context:** The conversation manager maintains a 3-turn sliding window with response summaries truncated to 250 characters, preventing memory and context explosion.
 - **Bounded Tool Limits:** File searches and directory listings are bounded (maximum 200–1000 items) to prevent large payload memory spikes.
 - **Connection Pools & Cleanup:** PostgreSQL connection pool is sized to 5 connections with clean context-manager disposal. `MCPHost` leverages `AsyncExitStack` for clean transport disconnection.
 
-### Multi-Model Gemini Fallback System
-The central orchestrator implements a resilient, multi-model fallback mechanism for request planning and response synthesis:
-- **Prioritized Model Hierarchy:** Configured via `.env`:
-  ```env
-  GEMINI_PRIMARY_MODEL=gemini-3.5-flash-lite
-  GEMINI_FALLBACK_MODELS=gemini-3.6-flash,gemini-3.8-flash,gemini-2.5-flash
-  GEMINI_MODEL_RETRY_ATTEMPTS=1
-  GEMINI_MODEL_RETRY_DELAY=0.5
-  ```
+### Dual-Layer Multi-Model Fallback System
+Both the central orchestrator and specialist agents implement independent, resilient multi-model fallback chains:
+- **Prioritized Model Traversal:** Tries the primary model (e.g. `gemini-3.5-flash-lite`) and automatically advances to fallbacks (`gemini-3.6-flash`, `gemini-3.8-flash`) if quotas or transient errors occur.
 - **Error Classification & Bounded Retries:**
-  - `DAILY_QUOTA_EXHAUSTED` (429 daily quota): Switches immediately to the next fallback model without latency delay, recording the exhausted model in cooldown for subsequent turns.
+  - `DAILY_QUOTA_EXHAUSTED` (429 daily quota): Switches immediately to the next fallback model without retry delay, recording the exhausted model in cooldown for subsequent turns.
   - `OVERLOADED_503`, `TIMEOUT`, `SERVER_ERROR_5XX`: Performs a bounded retry (1 attempt) before transitioning to the next candidate model.
   - `INVALID_REQUEST_400`, `AUTH_ERROR_401_403`: Terminate candidate evaluation immediately without futile fallback calls.
-- **Deterministic Heuristic Fallback:** If all configured Gemini models are exhausted or unavailable, planning and synthesis seamlessly revert to deterministic rule-based processing without crashing.
-- **Preservation of Agent Results:** Synthesis failures never trigger agent re-execution; collected findings from local specialist agents remain preserved.
+- **In-Memory Health Tracker (`AgentModelHealthTracker`):** Prevents redundant API requests to models currently experiencing cooldowns or quota exhaustion.
+- **Deterministic Heuristic Fallback:** If all configured Gemini models are exhausted or unavailable during orchestrator planning, execution safely reverts to deterministic rule-based processing without crashing.
+- **Preservation of Agent Results:** Synthesis failures never trigger agent re-execution; collected findings from specialist agents remain preserved.
 
 ---
 

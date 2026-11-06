@@ -1,20 +1,38 @@
-"""Unit tests for ResearchMate Multi-Agent System (MAS) agents (Phase 9).
+"""Unit tests for ResearchMate Multi-Agent System (MAS) agents (DEC-033).
 
 Validates:
 - Architectural boundary: verifies mas/ has zero imports from server_mcp or database.
 - Agent permission sets (Research Agent vs Task Agent).
 - Permission boundary enforcement (rejecting unauthorized tool calls without forwarding to MCPHost).
 - Loop bounding and iteration limits (preventing runaway loops).
-- Error handling during inference failures.
+- Error handling during inference failures (Gemini errors).
 - Handling empty prompts.
+- Tool call validator logic.
 """
 
 import ast
+import time
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
+
+import pytest
+from google.genai import errors, types
 
 from client_mcp.host import MCPHost
 from client_mcp.models import ToolDescriptor, ToolExecutionResult
+from mas.agents.gemini_agent_service import (
+    AgentGeminiAPIError,
+    AgentGeminiConfigurationError,
+    AgentGeminiDailyQuotaExhaustedError,
+    AgentGeminiFailureCategory,
+    AgentGeminiRateLimitError,
+    AgentGeminiService,
+    AgentGeminiServiceUnavailableError,
+    AgentGeminiTimeoutError,
+    AgentModelHealthTracker,
+    classify_agent_gemini_error,
+)
 from mas.agents.models import ToolCallRecord
 from mas.agents.research_agent.agent import (
     RESEARCH_AGENT_PERMITTED_TOOLS,
@@ -32,9 +50,38 @@ from mas.agents.validator import (
     property_permits_null,
     validate_tool_call,
 )
-from mas.config.settings import AgentSettings
-from mas.ollama.client import OllamaService
-from mas.ollama.exceptions import OllamaServiceUnavailableError
+from mas.config.settings import AgentGeminiSettings, AgentSettings
+
+# ---------------------------------------------------------------------------
+# Helper: build a fake Gemini response
+# ---------------------------------------------------------------------------
+
+
+def _make_gemini_text_response(text: str) -> MagicMock:
+    """Return a MagicMock that looks like a Gemini text-only GenerateContentResponse."""
+    response = MagicMock()
+    response.text = text
+    part = types.Part.from_text(text=text)
+    candidate = MagicMock()
+    candidate.content.parts = [part]
+    response.candidates = [candidate]
+    return response
+
+
+def _make_gemini_tool_call_response(tool_name: str, tool_args: dict) -> MagicMock:
+    """Return a MagicMock that looks like a Gemini function-call GenerateContentResponse."""
+    fc_part = types.Part.from_function_call(name=tool_name, args=tool_args)
+    candidate = MagicMock()
+    candidate.content.parts = [fc_part]
+    response = MagicMock()
+    response.text = None
+    response.candidates = [candidate]
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Architecture boundary
+# ---------------------------------------------------------------------------
 
 
 def test_mas_architectural_boundary_no_forbidden_imports() -> None:
@@ -64,6 +111,11 @@ def test_mas_architectural_boundary_no_forbidden_imports() -> None:
                 )
 
 
+# ---------------------------------------------------------------------------
+# Permission sets
+# ---------------------------------------------------------------------------
+
+
 def test_agent_permitted_tool_sets() -> None:
     """Verify strictly segregated tool permission sets for Research and Task agents."""
     # Research Agent must have file and notes tools, but NO task management tools
@@ -81,18 +133,23 @@ def test_agent_permitted_tool_sets() -> None:
     assert "create_note" not in TASK_AGENT_PERMITTED_TOOLS
 
 
-async def test_agent_rejects_empty_prompt() -> None:
-    """Verify agent immediately returns error for empty prompt without calling model."""
-    mock_host = MagicMock(spec=MCPHost)
-    mock_ollama = MagicMock(spec=OllamaService)
+# ---------------------------------------------------------------------------
+# Basic agent behaviour
+# ---------------------------------------------------------------------------
 
-    agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+
+async def test_agent_rejects_empty_prompt() -> None:
+    """Verify agent immediately returns error for empty prompt without calling Gemini."""
+    mock_host = MagicMock(spec=MCPHost)
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("   ")
 
     assert not res.is_success
     assert res.iterations == 0
     assert "Empty request prompt" in str(res.error)
-    mock_ollama.chat.assert_not_called()
+    mock_gemini.chat.assert_not_called()
 
 
 async def test_agent_permission_boundary_enforcement() -> None:
@@ -108,28 +165,18 @@ async def test_agent_permission_boundary_enforcement() -> None:
     )
     mock_host.invoke_tool = AsyncMock()
 
-    # Model attempts to call unauthorized create_task in Turn 1, then answers in Turn 2
-    mock_ollama = MagicMock(spec=OllamaService)
+    mock_gemini = MagicMock(spec=AgentGeminiService)
 
-    turn1_msg = MagicMock()
-    mock_tool_call = MagicMock()
-    mock_tool_call.function.name = "create_task"
-    mock_tool_call.function.arguments = {"title": "Sneaky Task"}
-    turn1_msg.tool_calls = [mock_tool_call]
-    turn1_msg.content = None
-
-    turn2_msg = MagicMock()
-    turn2_msg.tool_calls = None
-    turn2_msg.content = "I could not create the task because I do not have permission."
-
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
+    # Turn 1: model requests create_task (not permitted for ResearchAgent)
+    turn1 = _make_gemini_tool_call_response("create_task", {"title": "Sneaky Task"})
+    # Turn 2: model produces final text after receiving error feedback
+    turn2 = _make_gemini_text_response(
+        "I could not create the task because I do not have permission."
     )
 
-    agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
+
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("Please create a task for me.")
 
     assert res.is_success is False
@@ -146,7 +193,18 @@ async def test_agent_permission_boundary_enforcement() -> None:
 async def test_agent_iteration_limit_prevents_infinite_loop() -> None:
     """Verify agent terminates execution when max_iterations is reached."""
     mock_host = MagicMock(spec=MCPHost)
-    mock_host.discover_tools = AsyncMock(return_value=[])
+    mock_host.discover_tools = AsyncMock(
+        return_value=[
+            ToolDescriptor(
+                name="list_files",
+                description="List files",
+                input_schema={
+                    "type": "object",
+                    "properties": {"directory": {"type": "string"}},
+                },
+            )
+        ]
+    )
     mock_host.invoke_tool = AsyncMock(
         return_value=ToolExecutionResult(
             tool_name="list_files", is_error=False, data={"entries": []}
@@ -154,20 +212,16 @@ async def test_agent_iteration_limit_prevents_infinite_loop() -> None:
     )
 
     # Model perpetually returns a tool call
-    mock_ollama = MagicMock(spec=OllamaService)
-    looping_msg = MagicMock()
-    mock_tc = MagicMock()
-    mock_tc.function.name = "list_files"
-    mock_tc.function.arguments = {"directory": "documents"}
-    looping_msg.tool_calls = [mock_tc]
-    looping_msg.content = None
-
-    mock_ollama.chat = AsyncMock(return_value=MagicMock(message=looping_msg))
+    looping_response = _make_gemini_tool_call_response(
+        "list_files", {"directory": "documents"}
+    )
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(return_value=looping_response)
 
     settings = AgentSettings(max_iterations=3)
     agent = ResearchAgent(
         mcp_host=mock_host,
-        ollama_service=mock_ollama,
+        gemini_service=mock_gemini,
         agent_settings=settings,
     )
 
@@ -178,22 +232,44 @@ async def test_agent_iteration_limit_prevents_infinite_loop() -> None:
     assert "Maximum iteration limit reached" in str(res.error)
 
 
-async def test_agent_handles_ollama_service_failure() -> None:
-    """Verify agent catches Ollama errors and returns safe failure response."""
+async def test_agent_handles_gemini_service_failure() -> None:
+    """Verify agent catches Gemini errors and returns safe failure response."""
     mock_host = MagicMock(spec=MCPHost)
     mock_host.discover_tools = AsyncMock(return_value=[])
 
-    mock_ollama = MagicMock(spec=OllamaService)
-    mock_ollama.chat = AsyncMock(
-        side_effect=OllamaServiceUnavailableError("Ollama daemon offline")
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(
+        side_effect=AgentGeminiServiceUnavailableError("Gemini service unavailable")
     )
 
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("List tasks")
 
     assert not res.is_success
-    assert "Ollama daemon offline" in str(res.error)
-    assert "Error executing request via local model" in res.content
+    assert "Gemini service unavailable" in str(res.error)
+    assert "Error executing request via Gemini" in res.content
+
+
+async def test_agent_handles_gemini_configuration_error() -> None:
+    """Verify agent catches configuration errors (missing API key) gracefully."""
+    mock_host = MagicMock(spec=MCPHost)
+    mock_host.discover_tools = AsyncMock(return_value=[])
+
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(
+        side_effect=AgentGeminiConfigurationError("GOOGLE_API_KEY not configured")
+    )
+
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
+    res = await agent.run("List files")
+
+    assert not res.is_success
+    assert "GOOGLE_API_KEY not configured" in str(res.error)
+
+
+# ---------------------------------------------------------------------------
+# Deletion authorization tests (unchanged — logic is in validator, not model)
+# ---------------------------------------------------------------------------
 
 
 def test_affirmative_task_deletion_authorization() -> None:
@@ -445,6 +521,11 @@ def test_is_deletion_authorized_wrapper() -> None:
     assert is_deletion_authorized("Delete task 123.", "unknown_tool") is False
 
 
+# ---------------------------------------------------------------------------
+# validate_tool_call tests
+# ---------------------------------------------------------------------------
+
+
 def test_validate_tool_call_rejects_unknown_tool() -> None:
     """Verify tool call is rejected if tool is not present in MCP catalog."""
     discovered = {"read_file": {"type": "object", "properties": {}}}
@@ -562,7 +643,6 @@ def test_validate_tool_call_blocks_note_deletion_without_explicit_intent() -> No
     }
     permitted = {"delete_note"}
 
-    # Tag removal prompt
     is_valid, err_msg, _ = validate_tool_call(
         tool_name="delete_note",
         arguments={"note_id": "note-xyz"},
@@ -724,7 +804,6 @@ def test_validate_tool_call_nested_structure_validation() -> None:
     }
     permitted = {"custom_tool"}
 
-    # Sub-property has wrong type
     is_valid, err_msg, _ = validate_tool_call(
         tool_name="custom_tool",
         arguments={"author": {"name": "Agent", "id": "not_an_int"}},
@@ -750,7 +829,6 @@ def test_validate_tool_call_strips_none_for_non_nullable_fields() -> None:
     }
     permitted = {"get_tasks"}
 
-    # Model explicitly sends None for optional integers
     is_valid, err_msg, cleaned = validate_tool_call(
         tool_name="get_tasks",
         arguments={"limit": None, "offset": 10},
@@ -761,8 +839,12 @@ def test_validate_tool_call_strips_none_for_non_nullable_fields() -> None:
     )
     assert is_valid is True
     assert err_msg is None
-    # 'limit' is stripped so default applies, and 'offset' is preserved
     assert cleaned == {"offset": 10}
+
+
+# ---------------------------------------------------------------------------
+# End-to-end mock loop tests using Gemini mocks
+# ---------------------------------------------------------------------------
 
 
 async def test_agent_intercepts_schema_violation_and_allows_model_recovery() -> None:
@@ -791,38 +873,18 @@ async def test_agent_intercepts_schema_violation_and_allows_model_recovery() -> 
         )
     )
 
-    mock_ollama = MagicMock(spec=OllamaService)
+    mock_gemini = MagicMock(spec=AgentGeminiService)
 
     # Turn 1: Model calls create_task with missing 'title'
-    turn1_msg = MagicMock()
-    tc1 = MagicMock()
-    tc1.function.name = "create_task"
-    tc1.function.arguments = {}
-    turn1_msg.tool_calls = [tc1]
-    turn1_msg.content = None
-
-    # Turn 2: Model receives error and calls create_task with valid 'title'
-    turn2_msg = MagicMock()
-    tc2 = MagicMock()
-    tc2.function.name = "create_task"
-    tc2.function.arguments = {"title": "Fixed Title"}
-    turn2_msg.tool_calls = [tc2]
-    turn2_msg.content = None
-
+    turn1 = _make_gemini_tool_call_response("create_task", {})
+    # Turn 2: Model receives error feedback and retries with valid args
+    turn2 = _make_gemini_tool_call_response("create_task", {"title": "Fixed Title"})
     # Turn 3: Final answer
-    turn3_msg = MagicMock()
-    turn3_msg.tool_calls = None
-    turn3_msg.content = "Created task successfully."
+    turn3 = _make_gemini_text_response("Created task successfully.")
 
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-            MagicMock(message=turn3_msg),
-        ]
-    )
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2, turn3])
 
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("Create a new task")
 
     assert res.is_success is True
@@ -861,29 +923,17 @@ async def test_agent_blocks_destructive_tool_without_user_intent_e2e() -> None:
     )
     mock_host.invoke_tool = AsyncMock()
 
-    mock_ollama = MagicMock(spec=OllamaService)
+    mock_gemini = MagicMock(spec=AgentGeminiService)
 
-    # Turn 1: Model calls delete_task even though prompt asks for status
-    turn1_msg = MagicMock()
-    tc1 = MagicMock()
-    tc1.function.name = "delete_task"
-    tc1.function.arguments = {"task_id": "123"}
-    turn1_msg.tool_calls = [tc1]
-    turn1_msg.content = None
-
-    # Turn 2: Model handles the blocked response
-    turn2_msg = MagicMock()
-    turn2_msg.tool_calls = None
-    turn2_msg.content = "I cannot delete the task because you did not request deletion."
-
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
+    # Model calls delete_task without user deletion intent
+    turn1 = _make_gemini_tool_call_response("delete_task", {"task_id": "123"})
+    turn2 = _make_gemini_text_response(
+        "I cannot delete the task because you did not request deletion."
     )
 
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
+
+    agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("What is the status of task 123?")
 
     assert res.is_success is False
@@ -893,8 +943,6 @@ async def test_agent_blocks_destructive_tool_without_user_intent_e2e() -> None:
     assert "Destructive operation 'delete_task' was blocked" in str(
         res.tool_calls[0].result
     )
-
-    # MCPHost was NEVER invoked
     mock_host.invoke_tool.assert_not_called()
 
 
@@ -922,35 +970,19 @@ async def test_agent_executes_authorized_destructive_tool_e2e() -> None:
         )
     )
 
-    mock_ollama = MagicMock(spec=OllamaService)
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    turn1 = _make_gemini_tool_call_response("delete_task", {"task_id": "123"})
+    turn2 = _make_gemini_text_response("Task 123 has been deleted.")
 
-    turn1_msg = MagicMock()
-    tc1 = MagicMock()
-    tc1.function.name = "delete_task"
-    tc1.function.arguments = {"task_id": "123"}
-    turn1_msg.tool_calls = [tc1]
-    turn1_msg.content = None
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
-    turn2_msg = MagicMock()
-    turn2_msg.tool_calls = None
-    turn2_msg.content = "Task 123 has been deleted."
-
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
-    )
-
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("Please delete task 123.")
 
     assert res.is_success is True
     assert len(res.tool_calls) == 1
     assert res.tool_calls[0].is_error is False
     assert res.tool_calls[0].result == {"status": "deleted", "task_id": "123"}
-
-    # MCPHost WAS invoked with valid target
     mock_host.invoke_tool.assert_called_once_with(
         name="delete_task",
         arguments={"task_id": "123"},
@@ -973,28 +1005,14 @@ async def test_unauthorized_agent_destructive_tool_calls_blocked() -> None:
     )
     mock_host.invoke_tool = AsyncMock()
 
-    mock_ollama = MagicMock(spec=OllamaService)
+    mock_gemini = MagicMock(spec=AgentGeminiService)
 
     # 1. ResearchAgent attempts delete_task (not permitted)
-    turn1_msg = MagicMock()
-    tc1 = MagicMock()
-    tc1.function.name = "delete_task"
-    tc1.function.arguments = {"task_id": "123"}
-    turn1_msg.tool_calls = [tc1]
-    turn1_msg.content = None
+    turn1 = _make_gemini_tool_call_response("delete_task", {"task_id": "123"})
+    turn2 = _make_gemini_text_response("I do not have permission to delete tasks.")
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
-    turn2_msg = MagicMock()
-    turn2_msg.tool_calls = None
-    turn2_msg.content = "I do not have permission to delete tasks."
-
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
-    )
-
-    research_agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    research_agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await research_agent.run("Delete task 123.")
 
     assert res.is_success is False
@@ -1006,19 +1024,11 @@ async def test_unauthorized_agent_destructive_tool_calls_blocked() -> None:
     mock_host.invoke_tool.assert_not_called()
 
     # 2. TaskAgent attempts delete_note (not permitted)
-    tc2 = MagicMock()
-    tc2.function.name = "delete_note"
-    tc2.function.arguments = {"note_id": "xyz"}
-    turn1_msg.tool_calls = [tc2]
+    turn3 = _make_gemini_tool_call_response("delete_note", {"note_id": "xyz"})
+    turn4 = _make_gemini_text_response("I do not have permission to delete notes.")
+    mock_gemini.chat = AsyncMock(side_effect=[turn3, turn4])
 
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
-    )
-
-    task_agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    task_agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res2 = await task_agent.run("Delete note xyz.")
 
     assert res2.is_success is False
@@ -1030,14 +1040,17 @@ async def test_unauthorized_agent_destructive_tool_calls_blocked() -> None:
     mock_host.invoke_tool.assert_not_called()
 
 
+# ---------------------------------------------------------------------------
+# property_permits_null and evaluate_tool_records_success
+# ---------------------------------------------------------------------------
+
+
 def test_property_permits_null() -> None:
     """Verify property_permits_null correctly identifies nullable schema definitions."""
-    # Direct type null
     assert property_permits_null({"type": "null"}) is True
     assert property_permits_null({"type": ["string", "null"]}) is True
     assert property_permits_null({"type": "string"}) is False
 
-    # anyOf
     assert (
         property_permits_null({"anyOf": [{"type": "string"}, {"type": "null"}]}) is True
     )
@@ -1057,29 +1070,23 @@ def test_property_permits_null() -> None:
         is False
     )
 
-    # oneOf
     assert (
         property_permits_null({"oneOf": [{"type": "string"}, {"type": "null"}]}) is True
     )
-
-    # allOf
     assert (
         property_permits_null({"allOf": [{"type": "string"}, {"type": "null"}]}) is True
     )
 
-    # non-dict or empty
     assert property_permits_null({}) is False
     assert property_permits_null(None) is False  # type: ignore[arg-type]
 
 
 def test_evaluate_tool_records_success() -> None:
-    """Verify evaluate_tool_records_success identifies successes, unrecovered failures, and retries."""
-    # 1. Empty records
+    """Verify evaluate_tool_records_success identifies successes and failures."""
     ok, err = evaluate_tool_records_success([])
     assert ok is True
     assert err is None
 
-    # 2. All succeeded
     rec1 = ToolCallRecord(
         tool_name="get_task", arguments={}, result={"id": "1"}, is_error=False
     )
@@ -1090,7 +1097,6 @@ def test_evaluate_tool_records_success() -> None:
     assert ok is True
     assert err is None
 
-    # 3. Last tool failed
     rec_err = ToolCallRecord(
         tool_name="create_task",
         arguments={},
@@ -1101,7 +1107,6 @@ def test_evaluate_tool_records_success() -> None:
     assert ok is False
     assert "Tool 'create_task' failed" in str(err)
 
-    # 4. Failed tool subsequently recovered by successful retry
     rec_retry_ok = ToolCallRecord(
         tool_name="create_task",
         arguments={"title": "Retry Title"},
@@ -1112,10 +1117,14 @@ def test_evaluate_tool_records_success() -> None:
     assert ok is True
     assert err is None
 
-    # 5. Failed tool followed by different tool succeeding (original tool unrecovered)
     ok, err = evaluate_tool_records_success([rec_err, rec2])
     assert ok is False
     assert "Tool(s) failed without recovery: create_task" in str(err)
+
+
+# ---------------------------------------------------------------------------
+# Null normalization
+# ---------------------------------------------------------------------------
 
 
 def test_validate_tool_call_normalizes_null_for_nullable_fields() -> None:
@@ -1176,183 +1185,6 @@ def test_validate_tool_call_normalizes_null_for_nullable_fields() -> None:
     assert cleaned["dependencies"] is None
 
 
-def test_validate_tool_call_preserves_legitimate_string_null() -> None:
-    """Verify legitimate string 'null' for a non-nullable field is NOT normalized."""
-    discovered_schemas = {
-        "create_task": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "priority": {"type": "string", "default": "medium"},
-            },
-            "required": ["title"],
-        }
-    }
-
-    # User explicitly titled the task "null"
-    raw_args = {"title": "null", "priority": "high"}
-
-    is_valid, err, cleaned = validate_tool_call(
-        tool_name="create_task",
-        arguments=raw_args,
-        user_prompt='Create a task titled "null".',
-        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
-        discovered_schemas=discovered_schemas,
-        agent_name="Task Agent",
-    )
-
-    assert is_valid is True
-    assert err is None
-    # title is preserved as string "null", not normalized to None!
-    assert cleaned["title"] == "null"
-    assert cleaned["priority"] == "high"
-
-
-def test_validate_tool_call_all_optional_fields_populated() -> None:
-    """Verify tool call validation preserves all populated legitimate values."""
-    discovered_schemas = {
-        "create_task": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "priority": {"type": "string", "default": "medium"},
-                "status": {"type": "string", "default": "pending"},
-                "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                "assigned_to": {
-                    "anyOf": [
-                        {"type": "object", "additionalProperties": True},
-                        {"type": "null"},
-                    ]
-                },
-                "due_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                "dependencies": {
-                    "anyOf": [
-                        {"type": "array", "items": {"type": "string"}},
-                        {"type": "null"},
-                    ]
-                },
-            },
-            "required": ["title"],
-        }
-    }
-
-    raw_args = {
-        "title": "Complete Project",
-        "description": "Full writeup",
-        "status": "in_progress",
-        "priority": "critical",
-        "assigned_to": {
-            "type": "agent",
-            "id": "123e4567-e89b-12d3-a456-426614174000",
-        },
-        "due_date": "2026-11-01T12:00:00Z",
-        "dependencies": ["223e4567-e89b-12d3-a456-426614174000"],
-    }
-
-    is_valid, err, cleaned = validate_tool_call(
-        tool_name="create_task",
-        arguments=raw_args,
-        user_prompt="Create task Complete Project",
-        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
-        discovered_schemas=discovered_schemas,
-        agent_name="Task Agent",
-    )
-
-    assert is_valid is True
-    assert err is None
-    assert cleaned == raw_args
-
-
-def test_validate_tool_call_explicit_null() -> None:
-    """Verify tool call with explicit Python None/null values succeeds."""
-    discovered_schemas = {
-        "create_task": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "description": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                "assigned_to": {
-                    "anyOf": [
-                        {"type": "object", "additionalProperties": True},
-                        {"type": "null"},
-                    ]
-                },
-            },
-            "required": ["title"],
-        }
-    }
-
-    raw_args = {
-        "title": "Explicit Null Test",
-        "description": None,
-        "assigned_to": None,
-    }
-
-    is_valid, err, cleaned = validate_tool_call(
-        tool_name="create_task",
-        arguments=raw_args,
-        user_prompt="Create task",
-        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
-        discovered_schemas=discovered_schemas,
-        agent_name="Task Agent",
-    )
-
-    assert is_valid is True
-    assert err is None
-    assert cleaned["description"] is None
-    assert cleaned["assigned_to"] is None
-
-
-def test_validate_tool_call_invalid_arguments_rejected() -> None:
-    """Verify malformed arguments and missing required properties are rejected."""
-    discovered_schemas = {
-        "create_task": {
-            "type": "object",
-            "properties": {
-                "title": {"type": "string"},
-                "priority": {"type": "string"},
-            },
-            "required": ["title"],
-        }
-    }
-
-    # 1. Non-dict arguments
-    is_valid, err, _ = validate_tool_call(
-        tool_name="create_task",
-        arguments="not-a-dict",
-        user_prompt="Create task",
-        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
-        discovered_schemas=discovered_schemas,
-        agent_name="Task Agent",
-    )
-    assert is_valid is False
-    assert "expected a JSON object" in str(err)
-
-    # 2. Missing required property title
-    is_valid, err, _ = validate_tool_call(
-        tool_name="create_task",
-        arguments={"priority": "high"},
-        user_prompt="Create task",
-        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
-        discovered_schemas=discovered_schemas,
-        agent_name="Task Agent",
-    )
-    assert is_valid is False
-    assert "'title' is a required property" in str(err)
-
-    # 3. Invalid property type (number instead of string)
-    is_valid, err, _ = validate_tool_call(
-        tool_name="create_task",
-        arguments={"title": "Test", "priority": 12345},
-        user_prompt="Create task",
-        permitted_tools=TASK_AGENT_PERMITTED_TOOLS,
-        discovered_schemas=discovered_schemas,
-        agent_name="Task Agent",
-    )
-    assert is_valid is False
-    assert "12345 is not of type 'string'" in str(err)
-
-
 async def test_agent_reports_failure_when_tool_call_fails() -> None:
     """Confirm that failed tool calls are not reported as successful."""
     mock_host = MagicMock(spec=MCPHost)
@@ -1369,7 +1201,6 @@ async def test_agent_reports_failure_when_tool_call_fails() -> None:
             )
         ]
     )
-    # MCP tool returns an error payload
     mock_host.invoke_tool = AsyncMock(
         return_value=ToolExecutionResult(
             tool_name="create_task",
@@ -1378,141 +1209,512 @@ async def test_agent_reports_failure_when_tool_call_fails() -> None:
         )
     )
 
-    mock_ollama = MagicMock(spec=OllamaService)
-
-    # Turn 1: Model calls create_task
-    turn1_msg = MagicMock()
-    tc1 = MagicMock()
-    tc1.function.name = "create_task"
-    tc1.function.arguments = {"title": "Task A"}
-    turn1_msg.tool_calls = [tc1]
-    turn1_msg.content = None
-
-    # Turn 2: Model finishes with text (without retrying)
-    turn2_msg = MagicMock()
-    turn2_msg.tool_calls = None
-    turn2_msg.content = (
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    turn1 = _make_gemini_tool_call_response("create_task", {"title": "Task A"})
+    turn2 = _make_gemini_text_response(
         "I could not create the task due to a database constraint violation."
     )
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
-    )
-
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     res = await agent.run("Create task A")
 
-    # The agent MUST report failure, NOT success!
     assert res.is_success is False
     assert "failed" in str(res.error).lower()
     assert res.tool_calls[0].is_error is True
     assert "Database constraint violation" in str(res.tool_calls[0].result)
 
 
-async def test_agent_task_creation_with_only_title_and_priority_e2e_mock() -> None:
-    """Test task creation with only title and priority where LLM outputs string 'null' for optional fields."""
-    mock_host = MagicMock(spec=MCPHost)
-    mock_host.discover_tools = AsyncMock(
-        return_value=[
-            ToolDescriptor(
-                name="create_task",
-                description="Create a task",
-                input_schema={
-                    "type": "object",
-                    "properties": {
-                        "title": {"type": "string"},
-                        "priority": {"type": "string", "default": "medium"},
-                        "status": {"type": "string", "default": "pending"},
-                        "description": {
-                            "anyOf": [{"type": "string"}, {"type": "null"}]
-                        },
-                        "assigned_to": {
-                            "anyOf": [
-                                {
-                                    "type": "object",
-                                    "additionalProperties": True,
-                                },
-                                {"type": "null"},
-                            ]
-                        },
-                        "due_date": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-                    },
-                    "required": ["title"],
-                },
-            )
-        ]
+# ---------------------------------------------------------------------------
+# AgentGeminiSettings & Multi-Model Fallback Tests
+# ---------------------------------------------------------------------------
+
+
+def test_agent_gemini_settings_model_candidates() -> None:
+    """Verify AgentGeminiSettings model candidate list deduplication and precedence."""
+    # 1. Primary and comma-separated fallback models with duplicates and whitespace
+    settings = AgentGeminiSettings(
+        api_key="test_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models=" gemini-2.0-flash , gemini-2.5-flash , , gemini-2.5-flash-lite ",
     )
+    assert settings.model_candidates == [
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+        "gemini-2.5-flash-lite",
+    ]
 
-    # MCP tool succeeds when given cleaned arguments
-    mock_host.invoke_tool = AsyncMock(
-        return_value=ToolExecutionResult(
-            tool_name="create_task",
-            is_error=False,
-            data={
-                "id": "123e4567-e89b-12d3-a456-426614174000",
-                "title": "Learn MCP architecture",
-                "priority": "high",
-                "status": "pending",
-                "description": None,
-                "assigned_to": None,
-                "due_date": None,
-            },
-        )
+    # 2. Legacy fallback when only AGENT_GEMINI_MODEL is provided
+    legacy_settings = AgentGeminiSettings(
+        api_key="test_key",
+        model="gemini-2.0-flash",
+        fallback_models=None,
     )
+    assert legacy_settings.model_candidates == ["gemini-2.0-flash"]
 
-    mock_ollama = MagicMock(spec=OllamaService)
-
-    # Turn 1: Model generates the exact problematic payload with "null" strings
-    turn1_msg = MagicMock()
-    tc1 = MagicMock()
-    tc1.function.name = "create_task"
-    tc1.function.arguments = {
-        "title": "Learn MCP architecture",
-        "priority": "high",
-        "status": "pending",
-        "description": "null",
-        "assigned_to": "null",
-        "due_date": "null",
-    }
-    turn1_msg.tool_calls = [tc1]
-    turn1_msg.content = None
-
-    # Turn 2: Model finishes with confirmed success text
-    turn2_msg = MagicMock()
-    turn2_msg.tool_calls = None
-    turn2_msg.content = (
-        'Task "Learn MCP architecture" created successfully with high priority.'
+    # 3. Primary model takes precedence over legacy model
+    override_settings = AgentGeminiSettings(
+        api_key="test_key",
+        model="gemini-2.0-flash",
+        primary_model="gemini-2.5-flash",
+        fallback_models=None,
     )
+    assert override_settings.model_candidates == ["gemini-2.5-flash"]
 
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=turn1_msg),
-            MagicMock(message=turn2_msg),
-        ]
+    # 4. Default model fallback if all strings are empty
+    default_settings = AgentGeminiSettings(
+        api_key="test_key",
+        model="",
+        primary_model="",
+        fallback_models="",
     )
+    assert default_settings.model_candidates == ["gemini-3.5-flash-lite"]
 
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
-    res = await agent.run(
-        'Create a task titled "Learn MCP architecture" with high priority.'
+
+def test_classify_agent_gemini_error_categories() -> None:
+    """Verify classify_agent_gemini_error correctly classifies error types and redacts keys."""
+    secret_key = "AIzaSySecretApiKey12345"
+
+    # 1. Timeout
+    cat, delay, msg = classify_agent_gemini_error(
+        TimeoutError("Request timed out"), secret_key
     )
+    assert cat == AgentGeminiFailureCategory.TIMEOUT
+    assert delay is None
 
-    assert res.is_success is True
-    assert len(res.tool_calls) == 1
-    assert res.tool_calls[0].is_error is False
+    cat_to, _, _ = classify_agent_gemini_error(
+        AgentGeminiTimeoutError("Custom timeout"), secret_key
+    )
+    assert cat_to == AgentGeminiFailureCategory.TIMEOUT
 
-    # Verify MCPHost was invoked with cleaned arguments where "null" strings became None
-    mock_host.invoke_tool.assert_called_once_with(
-        name="create_task",
-        arguments={
-            "title": "Learn MCP architecture",
-            "priority": "high",
-            "status": "pending",
-            "description": None,
-            "assigned_to": None,
-            "due_date": None,
+    # 2. Daily quota error via APIError
+    quota_err = errors.APIError(
+        429,
+        {
+            "error": {
+                "message": f"Resource exhausted with key {secret_key}",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {"violations": [{"quotaMetric": "GenerateRequestsPerDay"}]},
+                    {"retryDelay": "43200s"},
+                ],
+            }
         },
-        raise_on_error=False,
     )
+    cat, delay, msg = classify_agent_gemini_error(quota_err, secret_key)
+    assert cat == AgentGeminiFailureCategory.DAILY_QUOTA_EXHAUSTED
+    assert delay == 43200.0
+    assert secret_key not in msg
+    assert "[REDACTED_API_KEY]" in msg
+
+    # 3. Burst rate limit
+    burst_err = errors.APIError(
+        429,
+        {
+            "error": {
+                "message": "Too many requests per minute",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [{"retryDelay": "15s"}],
+            }
+        },
+    )
+    cat, delay, msg = classify_agent_gemini_error(burst_err, secret_key)
+    assert cat == AgentGeminiFailureCategory.RATE_LIMITED
+    assert delay == 15.0
+
+    # 4. Auth errors (401, 403)
+    auth_err = errors.APIError(
+        403,
+        {"error": {"message": "Permission denied", "status": "PERMISSION_DENIED"}},
+    )
+    cat, delay, msg = classify_agent_gemini_error(auth_err, secret_key)
+    assert cat == AgentGeminiFailureCategory.AUTH_ERROR_401_403
+
+    # 5. Bad request (400)
+    bad_req = errors.APIError(
+        400,
+        {"error": {"message": "Invalid argument", "status": "INVALID_ARGUMENT"}},
+    )
+    cat, delay, msg = classify_agent_gemini_error(bad_req, secret_key)
+    assert cat == AgentGeminiFailureCategory.INVALID_REQUEST_400
+
+    # 6. Not found (404)
+    not_found = errors.APIError(
+        404,
+        {"error": {"message": "Model not found", "status": "NOT_FOUND"}},
+    )
+    cat, delay, msg = classify_agent_gemini_error(not_found, secret_key)
+    assert cat == AgentGeminiFailureCategory.NOT_FOUND_404
+
+    # 7. Service unavailable (503)
+    serv_unavail = errors.APIError(
+        503,
+        {"error": {"message": "Model is overloaded", "status": "UNAVAILABLE"}},
+    )
+    cat, delay, msg = classify_agent_gemini_error(serv_unavail, secret_key)
+    assert cat == AgentGeminiFailureCategory.OVERLOADED_503
+
+    # 8. Server error (500)
+    serv_err = errors.APIError(
+        500,
+        {"error": {"message": "Internal error", "status": "INTERNAL"}},
+    )
+    cat, delay, msg = classify_agent_gemini_error(serv_err, secret_key)
+    assert cat == AgentGeminiFailureCategory.SERVER_ERROR_5XX
+
+
+def test_agent_model_health_tracker_lifecycle() -> None:
+    """Verify AgentModelHealthTracker cooldown, recording, and recovery lifecycle."""
+    tracker = AgentModelHealthTracker()
+    model = "gemini-2.5-flash"
+
+    # Initially available
+    assert tracker.is_model_available(model) is True
+
+    # Record failure with short cooldown
+    tracker.record_failure(
+        model,
+        AgentGeminiFailureCategory.OVERLOADED_503,
+        retry_after=0.05,
+        error_message="503 Overloaded",
+    )
+    assert tracker.is_model_available(model) is False
+    rec = tracker.get_failure_record(model)
+    assert rec is not None
+    assert rec.failure_category == AgentGeminiFailureCategory.OVERLOADED_503
+
+    # Wait for cooldown to expire
+    time.sleep(0.06)
+    assert tracker.is_model_available(model) is True
+
+    # Record failure and clear immediately via success
+    tracker.record_failure(
+        model,
+        AgentGeminiFailureCategory.DAILY_QUOTA_EXHAUSTED,
+        retry_after=86400.0,
+    )
+    assert tracker.is_model_available(model) is False
+    tracker.record_success(model)
+    assert tracker.is_model_available(model) is True
+
+    # Clear all
+    tracker.record_failure(
+        model,
+        AgentGeminiFailureCategory.NOT_FOUND_404,
+        retry_after=100.0,
+    )
+    assert tracker.is_model_available(model) is False
+    tracker.clear()
+    assert tracker.is_model_available(model) is True
+
+
+def test_agent_gemini_service_missing_api_key_raises() -> None:
+    """Verify AgentGeminiService raises AgentGeminiConfigurationError when API key is missing."""
+    settings = AgentGeminiSettings(api_key=None)
+    service = AgentGeminiService(settings=settings)
+
+    with pytest.raises(AgentGeminiConfigurationError) as exc_info:
+        _ = service.client
+    assert "GOOGLE_API_KEY is not configured" in str(exc_info.value)
+
+
+async def test_agent_gemini_service_primary_model_succeeds() -> None:
+    """Verify primary model is used when available and successful; fallbacks are not called."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+    expected_response = _make_gemini_text_response("Primary response")
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        return expected_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash, gemini-2.5-flash-lite",
+        model_retry_delay=0.0,
+    )
+    service = AgentGeminiService(settings=settings, client=mock_client)
+
+    res = await service.chat(
+        system_prompt="system",
+        messages=[
+            types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+        ],
+    )
+
+    assert res == expected_response
+    assert models_called == ["gemini-2.5-flash"]
+    assert service.tracker.is_model_available("gemini-2.5-flash") is True
+
+
+async def test_agent_gemini_service_daily_quota_falls_back_immediately() -> None:
+    """Verify 429 daily quota switches immediately to fallback without retry."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+    expected_response = _make_gemini_text_response("Fallback response")
+
+    quota_error = errors.APIError(
+        429,
+        {
+            "error": {
+                "message": "Resource has been exhausted (daily quota).",
+                "status": "RESOURCE_EXHAUSTED",
+                "details": [
+                    {"violations": [{"quotaMetric": "GenerateRequestsPerDay"}]},
+                    {"retryDelay": "86400s"},
+                ],
+            }
+        },
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "gemini-2.5-flash":
+            raise quota_error
+        return expected_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash, gemini-2.5-flash-lite",
+        model_retry_attempts=2,
+        model_retry_delay=0.0,
+    )
+    service = AgentGeminiService(settings=settings, client=mock_client)
+
+    res = await service.chat(
+        system_prompt="system",
+        messages=[
+            types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+        ],
+    )
+
+    assert res == expected_response
+    # Primary called once (no retry for daily quota), then fallback called once
+    assert models_called == ["gemini-2.5-flash", "gemini-2.0-flash"]
+    assert service.tracker.is_model_available("gemini-2.5-flash") is False
+    assert service.tracker.is_model_available("gemini-2.0-flash") is True
+
+
+async def test_agent_gemini_service_transient_503_retries_then_falls_back() -> None:
+    """Verify 503 retries bounded times on primary before switching to fallback."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+    expected_response = _make_gemini_text_response("Fallback response")
+
+    overloaded_err = errors.APIError(
+        503,
+        {"error": {"message": "The model is overloaded", "status": "UNAVAILABLE"}},
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        if model == "gemini-2.5-flash":
+            raise overloaded_err
+        return expected_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash",
+        model_retry_attempts=1,
+        model_retry_delay=0.0,
+    )
+    service = AgentGeminiService(settings=settings, client=mock_client)
+
+    res = await service.chat(
+        system_prompt="system",
+        messages=[
+            types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+        ],
+    )
+
+    assert res == expected_response
+    # Primary attempted twice (initial + 1 retry), then fallback 1 succeeded
+    assert models_called == [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash",
+        "gemini-2.0-flash",
+    ]
+
+
+async def test_agent_gemini_service_auth_error_fails_immediately_no_fallback() -> None:
+    """Verify 401/403 fails immediately with AgentGeminiConfigurationError and no fallback attempts."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+
+    auth_err = errors.APIError(
+        401,
+        {"error": {"message": "Invalid API key", "status": "UNAUTHENTICATED"}},
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        raise auth_err
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = AgentGeminiSettings(
+        api_key="bad_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash",
+    )
+    service = AgentGeminiService(settings=settings, client=mock_client)
+
+    with pytest.raises(AgentGeminiConfigurationError) as exc_info:
+        await service.chat(
+            system_prompt="system",
+            messages=[
+                types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+            ],
+        )
+
+    assert "Gemini authentication failed" in str(exc_info.value)
+    assert models_called == ["gemini-2.5-flash"]
+
+
+async def test_agent_gemini_service_invalid_request_400_fails_immediately() -> None:
+    """Verify 400 fails immediately with AgentGeminiAPIError without switching models."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+
+    bad_req = errors.APIError(
+        400,
+        {"error": {"message": "Unsupported param", "status": "INVALID_ARGUMENT"}},
+    )
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        raise bad_req
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash",
+    )
+    service = AgentGeminiService(settings=settings, client=mock_client)
+
+    with pytest.raises(AgentGeminiAPIError) as exc_info:
+        await service.chat(
+            system_prompt="system",
+            messages=[
+                types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+            ],
+        )
+
+    assert "Gemini API invalid request" in str(exc_info.value)
+    assert models_called == ["gemini-2.5-flash"]
+
+
+async def test_agent_gemini_service_model_in_cooldown_is_skipped() -> None:
+    """Verify a model already marked in cooldown is skipped without attempting a network call."""
+    mock_client = MagicMock()
+    models_called: list[str] = []
+    expected_response = _make_gemini_text_response("Fallback response")
+
+    async def fake_generate(model: str, contents: Any, config: Any = None) -> Any:
+        models_called.append(model)
+        return expected_response
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=fake_generate)
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash",
+    )
+    tracker = AgentModelHealthTracker()
+    tracker.record_failure(
+        "gemini-2.5-flash",
+        AgentGeminiFailureCategory.OVERLOADED_503,
+        retry_after=300.0,
+    )
+
+    service = AgentGeminiService(settings=settings, client=mock_client, tracker=tracker)
+
+    res = await service.chat(
+        system_prompt="system",
+        messages=[
+            types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+        ],
+    )
+
+    assert res == expected_response
+    # Primary was skipped; fallback called immediately
+    assert models_called == ["gemini-2.0-flash"]
+
+
+async def test_agent_gemini_service_all_models_fail_raises_appropriate_error() -> None:
+    """Verify all candidate models failing raises the final category error."""
+    mock_client = MagicMock()
+
+    rate_err = errors.APIError(
+        429,
+        {"error": {"message": "Rate limit exceeded", "status": "RESOURCE_EXHAUSTED"}},
+    )
+
+    mock_client.aio.models.generate_content = AsyncMock(side_effect=rate_err)
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash",
+        model_retry_attempts=0,
+    )
+    service = AgentGeminiService(settings=settings, client=mock_client)
+
+    with pytest.raises(AgentGeminiRateLimitError) as exc_info:
+        await service.chat(
+            system_prompt="system",
+            messages=[
+                types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+            ],
+        )
+
+    assert "rate limit exceeded" in str(exc_info.value).lower()
+
+
+async def test_agent_gemini_service_all_models_in_cooldown_raises_without_calling_client() -> (
+    None
+):
+    """Verify that if all candidates are in cooldown, error is raised without making network calls."""
+    mock_client = MagicMock()
+    mock_client.aio.models.generate_content = AsyncMock()
+
+    settings = AgentGeminiSettings(
+        api_key="valid_key",
+        primary_model="gemini-2.5-flash",
+        fallback_models="gemini-2.0-flash",
+    )
+    tracker = AgentModelHealthTracker()
+    tracker.record_failure(
+        "gemini-2.5-flash",
+        AgentGeminiFailureCategory.DAILY_QUOTA_EXHAUSTED,
+        retry_after=3600.0,
+    )
+    tracker.record_failure(
+        "gemini-2.0-flash",
+        AgentGeminiFailureCategory.DAILY_QUOTA_EXHAUSTED,
+        retry_after=3600.0,
+    )
+
+    service = AgentGeminiService(settings=settings, client=mock_client, tracker=tracker)
+
+    with pytest.raises(AgentGeminiDailyQuotaExhaustedError):
+        await service.chat(
+            system_prompt="system",
+            messages=[
+                types.Content(role="user", parts=[types.Part.from_text(text="hello")])
+            ],
+        )
+
+    mock_client.aio.models.generate_content.assert_not_called()

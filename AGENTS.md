@@ -23,8 +23,7 @@ file and a document in `docs/` disagree, the document wins; report the conflict.
 - Do not add frameworks or infrastructure without approval. Avoid LangChain,
   LangGraph, CrewAI, AutoGen, Docker, Kubernetes, Redis, Kafka, OpenTelemetry
   and an agent gateway (DEC-023).
-- Do not reinstall Python, Git, Ollama or PostgreSQL if they are already working.
-- Do not download or switch Ollama models without explaining why and getting approval.
+- Do not reinstall Python, Git, or PostgreSQL if they are already working.
 - Add or update tests for every feature. Run them and report actual results.
   Do not call a stubbed or mocked feature complete.
 - At the end of each phase report: work completed, files changed, tests run and
@@ -62,9 +61,8 @@ data storage.
 
 Python (see open question about version), official MCP SDK over Streamable HTTP,
 PostgreSQL with SQLAlchemy + Psycopg, Alembic (Proposed), Pydantic Settings,
-Gemini via `google-genai` for the orchestrator, Ollama with `llama3.2:3b` for the
-Research and Task agents (shared runtime, one model instance), pytest,
-pytest-asyncio, Ruff.
+Google Gemini via `google-genai` with multi-model fallback for both the orchestrator
+and specialized agents (DEC-033), pytest, pytest-asyncio, Ruff.
 
-The machine is a Windows laptop with 8 GB RAM. Keep dependencies light, run one
-local model instance, and bound queries, file reads and context sizes.
+The machine is a Windows laptop with 8 GB RAM. Keep dependencies light, and
+bound queries, file reads and context sizes.

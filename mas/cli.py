@@ -28,7 +28,7 @@ Commands: /help (assistance), /status (health), /reset (clear context), /quit
 HELP_TEXT = """
 Available Commands:
   /help        - Show this help message and system capabilities.
-  /status      - Show connectivity status for PostgreSQL, MCP Server, Ollama, and Gemini.
+  /status      - Show connectivity status for PostgreSQL, MCP Server, and Gemini.
   /diagnostics - Query dynamic tool and resource counts from the active MCPHost session.
   /reset       - Clear multi-turn conversation history.
   /quit, /exit - Disconnect cleanly and terminate ResearchMate.
@@ -74,9 +74,6 @@ class ResearchMateCLI:
         )
         print(
             f"  {status_symbol(health.database)} PostgreSQL  : {health.details.get('database')}"
-        )
-        print(
-            f"  {status_symbol(health.ollama)} Ollama      : {health.details.get('ollama')}"
         )
         print(
             f"  {status_symbol(health.gemini)} Gemini API  : {health.details.get('gemini')}"

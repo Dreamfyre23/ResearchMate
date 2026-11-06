@@ -21,10 +21,6 @@ pydantic-settings>=2.16,<3
 # Orchestrator LLM (IMPLEMENTATION_PLAN Phase 10: google-genai SDK)
 google-genai>=2.34,<3
 
-# Local LLM client for Ollama (DEC-009). Not named explicitly in the docs;
-# see open questions in the setup report.
-ollama>=0.6,<1
-
 # Testing and linting (TEST_PLAN section 10)
 pytest>=9.2,<10
 pytest-asyncio>=1.4,<2

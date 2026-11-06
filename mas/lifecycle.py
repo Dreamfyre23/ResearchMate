@@ -1,4 +1,4 @@
-"""Service lifecycle and pre-flight validation management for ResearchMate (Phase 11).
+"""Service lifecycle and pre-flight validation management for ResearchMate (Phase 11 / DEC-033).
 
 Performs health checks on startup and coordinates graceful shutdown of connections
 and background tasks across all integrated components.
@@ -12,9 +12,7 @@ import httpx
 
 from client_mcp.config import get_client_settings
 from client_mcp.host import MCPHost
-from mas.config.settings import get_gemini_settings, get_ollama_settings
-from mas.ollama.client import OllamaService
-from mas.ollama.exceptions import OllamaModelNotFoundError
+from mas.config.settings import get_gemini_settings
 
 logger = logging.getLogger(__name__)
 
@@ -25,7 +23,6 @@ class ServiceHealth:
 
     mcp_server: bool = False
     database: bool = False
-    ollama: bool = False
     gemini: bool = False
     workspace: bool = False
     details: dict[str, str] = field(default_factory=dict)
@@ -83,35 +80,6 @@ async def check_mcp_server_health(
     except Exception as exc:  # noqa: BLE001
         err_msg = str(exc).strip() or type(exc).__name__
         return False, f"MCP health check failed: {err_msg}"
-
-
-async def check_ollama_health(
-    ollama_service: OllamaService | None = None,
-) -> tuple[bool, str]:
-    """Verify connectivity to local Ollama daemon and model availability.
-
-    Returns:
-        Tuple of (is_healthy, diagnostic_message).
-    """
-    service = ollama_service or OllamaService(settings=get_ollama_settings())
-    try:
-        is_up = await service.check_health()
-        if not is_up:
-            return False, f"Ollama HTTP service not responding at {service.base_url}"
-
-        try:
-            has_model = await service.ensure_model_available()
-            if not has_model:
-                return (
-                    False,
-                    f"Model '{service.model_name}' not found in local Ollama repository",
-                )
-        except OllamaModelNotFoundError as exc:
-            return False, str(exc)
-
-        return True, f"Ollama online with model '{service.model_name}'"
-    except Exception as exc:  # noqa: BLE001
-        return False, f"Ollama check failed: {exc}"
 
 
 def check_gemini_configuration() -> tuple[bool, str]:
@@ -194,12 +162,7 @@ async def run_preflight_checks(
         health.database = False
         health.details["database"] = "MCP server offline; cannot reach database"
 
-    # 4. Ollama
-    ollama_ok, ollama_msg = await check_ollama_health()
-    health.ollama = ollama_ok
-    health.details["ollama"] = ollama_msg
-
-    # 5. Gemini
+    # 4. Gemini (covers both orchestrator and agents — same API key, DEC-033)
     gemini_ok, gemini_msg = check_gemini_configuration()
     health.gemini = gemini_ok
     health.details["gemini"] = gemini_msg

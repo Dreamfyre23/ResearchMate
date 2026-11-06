@@ -30,8 +30,8 @@ def test_agent_model_instantiation() -> None:
     agent = Agent(
         name="Research Agent",
         role="research",
-        model="llama3.2:3b",
-        provider="ollama",
+        model="gemini-3.5-flash-lite",
+        provider="google",
     )
     assert agent.name == "Research Agent"
     assert agent.role == "research"

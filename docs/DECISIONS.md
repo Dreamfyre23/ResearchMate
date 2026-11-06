@@ -128,7 +128,7 @@ The current proposed catalog contains 19 tools and 17 resources.
 
 ### DEC-009 — Local agent model runtime
 
-**Status:** Accepted
+**Status:** Superseded (by DEC-033)
 
 **Decision:** Use Ollama to run local language models for the Research Agent and Task Agent.
 
@@ -136,7 +136,7 @@ The current proposed catalog contains 19 tools and 17 resources.
 
 ### DEC-010 — Initial local model
 
-**Status:** Proposed
+**Status:** Superseded (by DEC-033)
 
 **Decision:** Use `llama3.2:3b` as the initial local model for both the Research Agent and Task Agent.
 
@@ -146,13 +146,17 @@ The current proposed catalog contains 19 tools and 17 resources.
 
 **Note:** Validate actual task completion, structured output, and tool-use behavior before treating this model choice as permanent. Replace or revise it if testing shows inadequate performance.
 
+**Superseded by DEC-033:** Testing confirmed `llama3.2:3b` produces unreliable structured tool calls. Agents now use the Google Gemini API.
+
 ### DEC-011 — Shared local model runtime
 
-**Status:** Accepted
+**Status:** Superseded (by DEC-033)
 
 **Decision:** The initial local agents will use a shared Ollama runtime.
 
 **Rationale:** The development machine has limited memory and CPU resources. Running multiple separate model instances would increase resource consumption.
+
+**Superseded by DEC-033:** Agents migrated to Gemini API; Ollama runtime is no longer required.
 
 ---
 
@@ -485,6 +489,33 @@ Initially avoid adding:
 **Implications:** File Management tool suite operates across the workspace tree in read-only mode for the 6 supported file types. Filesystem boundary checks are enforced.
 
 **Date:** 2026-10-30
+
+### DEC-033 — Replace Ollama with Google Gemini API for Research and Task agents
+
+**Status:** Accepted
+
+**Decision:** Replace the Ollama local model runtime (llama3.2:3b) used by the Research Agent and Task Agent with the Google Gemini API, using the same `GOOGLE_API_KEY` and `google-genai` SDK already in use by the orchestrator. Sub-agents support a full multi-model fallback chain (`AGENT_GEMINI_PRIMARY_MODEL`, `AGENT_GEMINI_FALLBACK_MODELS`, `AGENT_GEMINI_MODEL_RETRY_ATTEMPTS`, `AGENT_GEMINI_MODEL_RETRY_DELAY`), with an in-memory health tracker (`AgentModelHealthTracker`) that isolates sub-agent rate limits, transient 503s, and daily quota events from orchestrator models. A legacy single-model configuration (`AGENT_GEMINI_MODEL`) remains supported for backwards compatibility.
+
+**Rationale:** During testing, `llama3.2:3b` frequently produced `OllamaInferenceError: Unexpected error during Ollama inference` failures when attempting structured function-calling for tools like `search_tasks`. A 3-billion parameter model running on CPU with 8 GB RAM is insufficiently capable for reliable JSON tool-call construction with complex schemas (Attribution objects, UUID arrays, enum values). The Gemini API provides native, reliable function-calling, better schema compliance, and no local hardware bottleneck. Both agents already share the same API key as the orchestrator.
+
+**Supersedes:** DEC-009 (Accepted → Superseded), DEC-010 (Proposed → Superseded), DEC-011 (Accepted → Superseded).
+
+**Alternatives considered:**
+- Upgrading to a larger local model (e.g., llama3.2:8b or qwen2.5:7b): Would improve tool-calling reliability but still limited by 8 GB RAM, CPU-only inference, and continued maintenance of a local daemon.
+- Keeping Ollama but pinning a different model: Rejected — hardware constraints make reliable function-calling difficult at any practical local model size without a GPU.
+
+**Implications:**
+- `mas/agents/base.py` rewritten to use `AgentGeminiService` (new `mas/agents/gemini_agent_service.py`) instead of `OllamaService`.
+- `mas/agents/task_agent/agent.py` and `mas/agents/research_agent/agent.py` updated — `OllamaService` dependency removed; `AgentGeminiService` injected.
+- `mas/config/settings.py` adds `AgentGeminiSettings` (env vars: `AGENT_GEMINI_PRIMARY_MODEL`, `AGENT_GEMINI_FALLBACK_MODELS`, `AGENT_GEMINI_MODEL`, `AGENT_GEMINI_TIMEOUT_SECONDS`, `AGENT_GEMINI_TEMPERATURE`, `AGENT_GEMINI_MODEL_RETRY_ATTEMPTS`, `AGENT_GEMINI_MODEL_RETRY_DELAY`).
+- `mas/agents/gemini_agent_service.py` implements resilient multi-model fallback traversal and health tracking for sub-agents.
+- `mas/lifecycle.py` updated — Ollama removed from pre-flight checks; `check_ollama_health` retained as an optional utility but not called by `run_preflight_checks`.
+- `mas/ollama/` module retained but no longer used by agents. It remains available for optional diagnostics and is not deleted to preserve test coverage.
+- `.env.example` updated with agent Gemini model settings and Ollama section commented out.
+- All agent unit and integration tests updated to mock `AgentGeminiService` instead of `OllamaService`.
+- `PROJECT_REQUIREMENTS.md` technology table updated.
+
+**Date:** 2026-11-02
 
 ---
 

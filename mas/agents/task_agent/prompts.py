@@ -1,7 +1,8 @@
-"""System prompts and instructions for Task Agent (Phase 13).
+"""System prompts and instructions for Task Agent (DEC-033).
 
-Engineered for local Ollama (llama3.2:3b) inference, dynamic MCP schema compliance,
-accurate tool selection, reliable argument construction, and grounded task execution.
+Engineered for Google Gemini function-calling inference, dynamic MCP schema
+compliance, accurate tool selection, reliable argument construction, and
+grounded task execution.
 """
 
 TASK_AGENT_SYSTEM_PROMPT = """# Role and Objective

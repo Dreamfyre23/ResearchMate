@@ -6,8 +6,11 @@ empty-result handling, error recovery, multi-tool workflows, and security preser
 
 from unittest.mock import AsyncMock, MagicMock
 
+from google.genai import types
+
 from client_mcp.host import MCPHost
 from client_mcp.models import ToolDescriptor, ToolExecutionResult
+from mas.agents.gemini_agent_service import AgentGeminiService
 from mas.agents.research_agent.agent import (
     RESEARCH_AGENT_PERMITTED_TOOLS,
     ResearchAgent,
@@ -16,7 +19,28 @@ from mas.agents.research_agent.prompts import RESEARCH_AGENT_SYSTEM_PROMPT
 from mas.agents.task_agent.agent import TASK_AGENT_PERMITTED_TOOLS, TaskAgent
 from mas.agents.task_agent.prompts import TASK_AGENT_SYSTEM_PROMPT
 from mas.agents.validator import validate_tool_call
-from mas.ollama.client import OllamaService
+
+
+def _make_gemini_text_response(text: str) -> MagicMock:
+    """Return a MagicMock that looks like a Gemini text-only GenerateContentResponse."""
+    response = MagicMock()
+    response.text = text
+    candidate = MagicMock()
+    candidate.content.parts = [types.Part.from_text(text=text)]
+    response.candidates = [candidate]
+    return response
+
+
+def _make_gemini_tool_call_response(tool_name: str, tool_args: dict) -> MagicMock:
+    """Return a MagicMock that looks like a Gemini function-call GenerateContentResponse."""
+    fc_part = types.Part.from_function_call(name=tool_name, args=tool_args)
+    candidate = MagicMock()
+    candidate.content.parts = [fc_part]
+    response = MagicMock()
+    response.text = None
+    response.candidates = [candidate]
+    return response
+
 
 # ==============================================================================
 # 1. Prompt Structure & Schema Accuracy Tests
@@ -470,29 +494,18 @@ async def test_research_agent_multi_tool_workflow_search_then_read() -> None:
     # Step 1: search_files returns matches
     # Step 2: read_file returns content
     # Step 3: final summary
-    step1_call = MagicMock()
-    step1_call.function.name = "search_files"
-    step1_call.function.arguments = {"query": "deep learning", "file_type": ".md"}
-
-    step2_call = MagicMock()
-    step2_call.function.name = "read_file"
-    step2_call.function.arguments = {"file_path": "reports/deep_learning.md"}
-
-    msg1 = MagicMock(tool_calls=[step1_call], content=None)
-    msg2 = MagicMock(tool_calls=[step2_call], content=None)
-    msg3 = MagicMock(
-        tool_calls=None,
-        content="Found survey report: Transformers achieve state-of-the-art results.",
+    turn1 = _make_gemini_tool_call_response(
+        "search_files", {"query": "deep learning", "file_type": ".md"}
+    )
+    turn2 = _make_gemini_tool_call_response(
+        "read_file", {"file_path": "reports/deep_learning.md"}
+    )
+    turn3 = _make_gemini_text_response(
+        "Found survey report: Transformers achieve state-of-the-art results."
     )
 
-    mock_ollama = MagicMock(spec=OllamaService)
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=msg1),
-            MagicMock(message=msg2),
-            MagicMock(message=msg3),
-        ]
-    )
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2, turn3])
 
     async def fake_invoke(
         name: str, arguments: dict, raise_on_error: bool = False
@@ -521,7 +534,7 @@ async def test_research_agent_multi_tool_workflow_search_then_read() -> None:
 
     mock_host.invoke_tool = AsyncMock(side_effect=fake_invoke)
 
-    agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     response = await agent.run("Find and summarize reports on deep learning")
 
     assert response.is_success is True
@@ -565,32 +578,22 @@ async def test_task_agent_multi_tool_workflow_list_agents_then_create_task() -> 
     )
 
     agent_uuid = "f47ac10b-58cc-4372-a567-0e02b2c3d479"
-    step1_call = MagicMock()
-    step1_call.function.name = "list_agents"
-    step1_call.function.arguments = {"role": "research", "status": "active"}
-
-    step2_call = MagicMock()
-    step2_call.function.name = "create_task"
-    step2_call.function.arguments = {
-        "title": "Review Literature",
-        "assigned_to": {"agent_id": agent_uuid},
-    }
-
-    msg1 = MagicMock(tool_calls=[step1_call], content=None)
-    msg2 = MagicMock(tool_calls=[step2_call], content=None)
-    msg3 = MagicMock(
-        tool_calls=None,
-        content=f"Created task 'Review Literature' and assigned to Research Agent ({agent_uuid}).",
+    turn1 = _make_gemini_tool_call_response(
+        "list_agents", {"role": "research", "status": "active"}
+    )
+    turn2 = _make_gemini_tool_call_response(
+        "create_task",
+        {
+            "title": "Review Literature",
+            "assigned_to": {"agent_id": agent_uuid},
+        },
+    )
+    turn3 = _make_gemini_text_response(
+        f"Created task 'Review Literature' and assigned to Research Agent ({agent_uuid})."
     )
 
-    mock_ollama = MagicMock(spec=OllamaService)
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=msg1),
-            MagicMock(message=msg2),
-            MagicMock(message=msg3),
-        ]
-    )
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2, turn3])
 
     async def fake_invoke(
         name: str, arguments: dict, raise_on_error: bool = False
@@ -626,7 +629,7 @@ async def test_task_agent_multi_tool_workflow_list_agents_then_create_task() -> 
 
     mock_host.invoke_tool = AsyncMock(side_effect=fake_invoke)
 
-    agent = TaskAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = TaskAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     response = await agent.run(
         "Assign a new literature review task to an active research agent"
     )
@@ -660,20 +663,15 @@ async def test_empty_result_handling_no_hallucination() -> None:
         ]
     )
 
-    step1_call = MagicMock()
-    step1_call.function.name = "search_notes"
-    step1_call.function.arguments = {"query": "nonexistent topic"}
-
-    msg1 = MagicMock(tool_calls=[step1_call], content=None)
-    msg2 = MagicMock(
-        tool_calls=None,
-        content="No research notes were found matching 'nonexistent topic'.",
+    turn1 = _make_gemini_tool_call_response(
+        "search_notes", {"query": "nonexistent topic"}
+    )
+    turn2 = _make_gemini_text_response(
+        "No research notes were found matching 'nonexistent topic'."
     )
 
-    mock_ollama = MagicMock(spec=OllamaService)
-    mock_ollama.chat = AsyncMock(
-        side_effect=[MagicMock(message=msg1), MagicMock(message=msg2)]
-    )
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
     mock_host.invoke_tool = AsyncMock(
         return_value=ToolExecutionResult(
@@ -683,7 +681,7 @@ async def test_empty_result_handling_no_hallucination() -> None:
         )
     )
 
-    agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     response = await agent.run("Find notes about nonexistent topic")
 
     assert response.is_success is True
@@ -709,26 +707,18 @@ async def test_error_recovery_on_validation_feedback() -> None:
     )
 
     # Iteration 1: Model makes an invalid call missing 'file_path'
-    bad_call = MagicMock()
-    bad_call.function.name = "read_file"
-    bad_call.function.arguments = {}
+    bad_call = _make_gemini_tool_call_response("read_file", {})
 
     # Iteration 2: Model receives feedback and recovers with valid 'file_path'
-    good_call = MagicMock()
-    good_call.function.name = "read_file"
-    good_call.function.arguments = {"file_path": "documents/report.txt"}
+    good_call = _make_gemini_tool_call_response(
+        "read_file", {"file_path": "documents/report.txt"}
+    )
 
     # Iteration 3: Final answer
-    final_msg = MagicMock(tool_calls=None, content="File content: Research overview.")
+    final_turn = _make_gemini_text_response("File content: Research overview.")
 
-    mock_ollama = MagicMock(spec=OllamaService)
-    mock_ollama.chat = AsyncMock(
-        side_effect=[
-            MagicMock(message=MagicMock(tool_calls=[bad_call])),
-            MagicMock(message=MagicMock(tool_calls=[good_call])),
-            MagicMock(message=final_msg),
-        ]
-    )
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    mock_gemini.chat = AsyncMock(side_effect=[bad_call, good_call, final_turn])
 
     mock_host.invoke_tool = AsyncMock(
         return_value=ToolExecutionResult(
@@ -738,7 +728,7 @@ async def test_error_recovery_on_validation_feedback() -> None:
         )
     )
 
-    agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     response = await agent.run("Read report.txt in documents")
 
     # The first tool call failed validation, second succeeded -> overall success is True
@@ -759,16 +749,13 @@ async def test_avoidance_of_unnecessary_tool_calls_for_greetings() -> None:
     mock_host = MagicMock(spec=MCPHost)
     mock_host.discover_tools = AsyncMock(return_value=[])
 
-    mock_ollama = MagicMock(spec=OllamaService)
-    greeting_reply = MagicMock(
-        message=MagicMock(
-            tool_calls=None,
-            content="Hello! I am your Research Agent. How can I assist you with your academic documents or notes today?",
-        )
+    mock_gemini = MagicMock(spec=AgentGeminiService)
+    greeting_reply = _make_gemini_text_response(
+        "Hello! I am your Research Agent. How can I assist you with your academic documents or notes today?"
     )
-    mock_ollama.chat = AsyncMock(return_value=greeting_reply)
+    mock_gemini.chat = AsyncMock(return_value=greeting_reply)
 
-    agent = ResearchAgent(mcp_host=mock_host, ollama_service=mock_ollama)
+    agent = ResearchAgent(mcp_host=mock_host, gemini_service=mock_gemini)
     response = await agent.run("Hello, who are you?")
 
     assert response.is_success is True

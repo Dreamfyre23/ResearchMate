@@ -1,41 +1,114 @@
-"""Base agent abstraction for local Multi-Agent System (MAS) agents (Phase 9).
+"""Base agent abstraction for Multi-Agent System (MAS) agents (DEC-033).
 
-Provides the core agent reasoning loop, tool permission filtering, Ollama schema conversion,
-MCP tool execution via MCPHost, and iteration-bounding protection against infinite loops.
+Provides the core agent reasoning loop, tool permission filtering, Gemini
+native function-calling integration, MCP tool execution via MCPHost, and
+iteration-bounding protection against infinite loops.
 """
 
-import json
 import logging
 from typing import Any
 
+from google.genai import types
+
 from client_mcp.host import MCPHost
 from client_mcp.models import ToolDescriptor
+from mas.agents.gemini_agent_service import (
+    AgentGeminiError,
+    AgentGeminiService,
+    _descriptor_to_gemini_tool,
+)
 from mas.agents.models import AgentRequest, AgentResponse, ToolCallRecord
 from mas.agents.validator import evaluate_tool_records_success, validate_tool_call
 from mas.config.settings import AgentSettings, get_agent_settings
-from mas.ollama.client import OllamaService
-from mas.ollama.exceptions import OllamaError
 
 logger = logging.getLogger(__name__)
 
 
-def _descriptor_to_ollama(tool: ToolDescriptor) -> dict[str, Any]:
-    """Convert an MCP ToolDescriptor into the standard Ollama function tool format."""
-    schema = (
-        tool.input_schema if tool.input_schema else {"type": "object", "properties": {}}
-    )
-    return {
-        "type": "function",
-        "function": {
-            "name": tool.name,
-            "description": tool.description,
-            "parameters": schema,
-        },
-    }
+def _response_to_tool_calls(
+    response: Any,
+) -> list[Any] | None:
+    """Extract function calls from a Gemini GenerateContentResponse, or None."""
+    try:
+        candidate = response.candidates[0]
+        parts = candidate.content.parts if candidate.content else []
+        calls = [p.function_call for p in parts if p.function_call]
+        return calls if calls else None
+    except (AttributeError, IndexError):
+        return None
+
+
+def _response_to_text(response: Any) -> str:
+    """Extract the final text from a Gemini GenerateContentResponse."""
+    try:
+        return response.text or ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _build_gemini_messages(
+    raw_messages: list[dict[str, Any]],
+) -> list[types.Content]:
+    """Convert the accumulated message list into Gemini Content objects.
+
+    The system prompt is handled separately via GenerateContentConfig, so
+    this function maps only user/model/tool-result roles.
+
+    Supported roles in raw_messages:
+      - "user"          -> role="user" with text Part
+      - "model"         -> role="model" with text Part
+      - "function_call" -> role="model" with function_call Part(s)
+      - "tool"          -> role="user" with function_response Part
+    """
+    contents: list[types.Content] = []
+    for msg in raw_messages:
+        role = msg.get("role", "user")
+        content = msg.get("content", "")
+
+        if role == "user":
+            contents.append(
+                types.Content(
+                    role="user", parts=[types.Part.from_text(text=str(content))]
+                )
+            )
+        elif role == "model":
+            contents.append(
+                types.Content(
+                    role="model", parts=[types.Part.from_text(text=str(content))]
+                )
+            )
+        elif role == "model_content":
+            # Exact Content object preserved from model response, keeping thought_signature
+            raw_content = msg.get("content")
+            if isinstance(raw_content, types.Content):
+                contents.append(raw_content)
+            elif raw_content is not None:
+                contents.append(
+                    types.Content(role="model", parts=list(raw_content.parts))
+                )
+        elif role == "function_call":
+            fc_parts: list[types.Part] = msg.get("parts", [])
+            contents.append(types.Content(role="model", parts=fc_parts))
+        elif role == "tool":
+            tool_name = msg.get("name", "tool")
+            tool_resp = msg.get("response", {})
+            contents.append(
+                types.Content(
+                    role="user",
+                    parts=[
+                        types.Part.from_function_response(
+                            name=tool_name,
+                            response=tool_resp
+                            if isinstance(tool_resp, dict)
+                            else {"result": tool_resp},
+                        )
+                    ],
+                )
+            )
+    return contents
 
 
 class BaseAgent:
-    """Base class for all local AI agents in the ResearchMate system."""
+    """Base class for all Gemini-powered AI agents in the ResearchMate system."""
 
     def __init__(
         self,
@@ -43,14 +116,14 @@ class BaseAgent:
         system_prompt: str,
         permitted_tools: set[str],
         mcp_host: MCPHost,
-        ollama_service: OllamaService | None = None,
+        gemini_service: AgentGeminiService | None = None,
         settings: AgentSettings | None = None,
     ) -> None:
         self.agent_name = agent_name
         self.system_prompt = system_prompt
         self.permitted_tools = set(permitted_tools)
         self.mcp_host = mcp_host
-        self.ollama_service = ollama_service or OllamaService()
+        self.gemini_service = gemini_service or AgentGeminiService()
         self.settings = settings or get_agent_settings()
 
     async def get_permitted_tool_descriptors(self) -> list[ToolDescriptor]:
@@ -61,10 +134,12 @@ class BaseAgent:
     async def run(self, request: AgentRequest | str) -> AgentResponse:
         """Execute the agent reasoning loop for a given user request.
 
-        1. Discovers available tools dynamically and filters strictly to permitted tools.
-        2. Formats messages and calls Ollama with tools.
-        3. Loops tool calls until final response or max iterations reached.
-        4. Bounds iterations to prevent infinite loops (8GB RAM optimization).
+        1. Discovers available tools dynamically and filters to permitted set.
+        2. Converts tool descriptors to Gemini Tool objects.
+        3. Sends user turn to Gemini with function-calling config.
+        4. Loops on function_call parts, executes tools via MCPHost, feeds
+           function_response parts back to the model.
+        5. Terminates on a text-only response or after max_iterations.
         """
         if isinstance(request, str):
             request = AgentRequest(prompt=request)
@@ -79,14 +154,20 @@ class BaseAgent:
                 error="Empty request prompt",
             )
 
-        # 1. Discover tools and input schemas dynamically
+        # --- Tool discovery ---
         all_tools = await self.mcp_host.discover_tools()
         discovered_schemas = {t.name: (t.input_schema or {}) for t in all_tools}
         permitted_descriptors = [t for t in all_tools if t.name in self.permitted_tools]
-        ollama_tools = [_descriptor_to_ollama(t) for t in permitted_descriptors]
 
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": self.system_prompt},
+        gemini_tools: list[types.Tool] = [
+            _descriptor_to_gemini_tool(
+                t.name, t.description or "", t.input_schema or {}
+            )
+            for t in permitted_descriptors
+        ]
+
+        # --- Conversation history (excludes system prompt, handled via config) ---
+        raw_messages: list[dict[str, Any]] = [
             {"role": "user", "content": prompt_text},
         ]
 
@@ -98,18 +179,19 @@ class BaseAgent:
             while iteration < self.settings.max_iterations:
                 iteration += 1
 
-                # Send request to local Ollama model
-                response = await self.ollama_service.chat(
-                    messages=messages,
-                    tools=ollama_tools if ollama_tools else None,
+                gemini_contents = _build_gemini_messages(raw_messages)
+
+                response = await self.gemini_service.chat(
+                    system_prompt=self.system_prompt,
+                    messages=gemini_contents,
+                    tools=gemini_tools if gemini_tools else None,
                 )
 
-                response_message = response.message
-                tool_calls = getattr(response_message, "tool_calls", None)
+                function_calls = _response_to_tool_calls(response)
 
-                # Check if the model produced tool calls or final answer
-                if not tool_calls:
-                    final_content = response_message.content or ""
+                if not function_calls:
+                    # No tool calls — model produced a final text response
+                    final_content = _response_to_text(response)
                     is_success, eval_err = evaluate_tool_records_success(tool_records)
                     return AgentResponse(
                         agent_name=self.agent_name,
@@ -120,15 +202,32 @@ class BaseAgent:
                         error=eval_err,
                     )
 
-                # Append assistant message with tool calls to history
-                messages.append(response_message)
+                # Record model turn with function_call Part(s).
+                # Preserve candidate.content from the SDK response so thought_signature is kept.
+                candidate = (
+                    response.candidates[0]
+                    if getattr(response, "candidates", None)
+                    else None
+                )
+                if candidate and getattr(candidate, "content", None):
+                    raw_messages.append(
+                        {"role": "model_content", "content": candidate.content}
+                    )
+                else:
+                    model_parts = [
+                        types.Part.from_function_call(
+                            name=fc.name,
+                            args=dict(fc.args) if fc.args else {},
+                        )
+                        for fc in function_calls
+                    ]
+                    raw_messages.append({"role": "function_call", "parts": model_parts})
 
-                # Execute each tool call requested by the model
-                for tc in tool_calls:
-                    func_name = tc.function.name
-                    func_args = tc.function.arguments
+                # --- Execute each function call ---
+                for fc in function_calls:
+                    func_name: str = fc.name
+                    func_args: dict[str, Any] = dict(fc.args) if fc.args else {}
 
-                    # Validate tool call against schema and safety policies
                     is_valid, validation_err, cleaned_args = validate_tool_call(
                         tool_name=func_name,
                         arguments=func_args,
@@ -147,18 +246,16 @@ class BaseAgent:
                         )
                         feedback_msg = (
                             f"Validation error for tool '{func_name}': {validation_err}. "
-                            "Please correct the arguments and retry. Remember that optional nullable parameters "
-                            "should be JSON null (null without quotes) or omitted, never the string 'null'."
+                            "Please correct the arguments and retry. Remember that optional "
+                            "nullable parameters should be JSON null or omitted, never the "
+                            "string 'null'."
                         )
                         tool_result: Any = {"error": feedback_msg}
                         is_err = True
                         recorded_args = (
-                            cleaned_args
-                            if isinstance(func_args, dict)
-                            else {"raw_arguments": func_args}
+                            cleaned_args if isinstance(func_args, dict) else {}
                         )
                     else:
-                        # Invoke tool via MCPHost
                         logger.info(
                             "Agent '%s' invoking tool '%s' with args %s",
                             self.agent_name,
@@ -183,15 +280,21 @@ class BaseAgent:
                         )
                     )
 
-                    # Serialize result back to model in tool role
-                    content_str = (
-                        json.dumps(tool_result)
-                        if not isinstance(tool_result, str)
-                        else tool_result
+                    # Feed tool result back as a function_response
+                    content_data = (
+                        tool_result
+                        if isinstance(tool_result, dict)
+                        else {"result": str(tool_result)}
                     )
-                    messages.append({"role": "tool", "content": content_str})
+                    raw_messages.append(
+                        {
+                            "role": "tool",
+                            "name": func_name,
+                            "response": content_data,
+                        }
+                    )
 
-            # Exceeded maximum loop limit
+            # Exceeded iteration limit
             logger.warning(
                 "Agent '%s' reached maximum iteration limit (%d)",
                 self.agent_name,
@@ -201,8 +304,8 @@ class BaseAgent:
                 agent_name=self.agent_name,
                 content=final_content
                 or (
-                    f"Agent reached maximum execution limit ({self.settings.max_iterations} iterations) "
-                    "without producing a final answer."
+                    f"Agent reached maximum execution limit ({self.settings.max_iterations} "
+                    "iterations) without producing a final answer."
                 ),
                 tool_calls=tool_records,
                 iterations=iteration,
@@ -210,15 +313,18 @@ class BaseAgent:
                 error="Maximum iteration limit reached",
             )
 
-        except OllamaError as exc:
-            logger.error("Ollama error during %s execution: %s", self.agent_name, exc)
+        except AgentGeminiError as exc:
+            safe_msg = str(exc)
+            logger.error(
+                "Gemini error during %s execution: %s", self.agent_name, safe_msg
+            )
             return AgentResponse(
                 agent_name=self.agent_name,
-                content=f"Error executing request via local model: {exc}",
+                content=f"Error executing request via Gemini: {safe_msg}",
                 tool_calls=tool_records,
                 iterations=iteration,
                 is_success=False,
-                error=str(exc),
+                error=safe_msg,
             )
         except Exception as exc:  # noqa: BLE001
             logger.error(

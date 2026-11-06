@@ -1,8 +1,15 @@
-"""Integration tests for ResearchMate Multi-Agent System (MAS) agents (Phase 9).
+"""Integration tests for ResearchMate Multi-Agent System (MAS) agents (DEC-033).
 
 Validates end-to-end execution of:
-- ResearchAgent invoking File Management tools through MCPHost over Streamable HTTP with real local Ollama.
-- TaskAgent invoking Task Management tools through MCPHost over Streamable HTTP with real local Ollama.
+- ResearchAgent invoking File Management tools through MCPHost over Streamable HTTP
+  with mocked Gemini service (real Gemini calls require live API key).
+- TaskAgent invoking Task Management tools through MCPHost over Streamable HTTP
+  with mocked Gemini service.
+- Schema validation against real MCP server schemas.
+- Destructive intent safeguard against real MCP server.
+
+DEC-033: Sub-agents run on Google Gemini. Integration tests use a mocked
+AgentGeminiService for offline determinism.
 """
 
 import asyncio
@@ -13,12 +20,13 @@ from unittest.mock import AsyncMock, MagicMock
 import httpx
 import pytest
 import uvicorn
+from google.genai import types
 
 from client_mcp.config import MCPClientSettings
 from client_mcp.host import MCPHost
+from mas.agents.gemini_agent_service import AgentGeminiService
 from mas.agents.research_agent.agent import ResearchAgent
 from mas.agents.task_agent.agent import TaskAgent
-from mas.ollama.client import OllamaService
 from server_mcp.config import MCPServerSettings
 from server_mcp.server import create_app
 
@@ -65,95 +73,116 @@ async def running_mcp_server() -> AsyncGenerator[str, None]:
     await server_task
 
 
-@pytest.fixture
-async def ollama_available() -> bool:
-    """Verify local Ollama service and model are available, otherwise skip."""
-    service = OllamaService()
-    if not await service.check_health():
-        pytest.skip("Local Ollama daemon is not running on localhost:11434")
-    try:
-        await service.ensure_model_available()
-    except Exception as exc:  # noqa: BLE001
-        pytest.skip(f"Ollama model '{service.model_name}' not available: {exc}")
-    return True
+# ---------------------------------------------------------------------------
+# Helpers to build mock Gemini responses
+# ---------------------------------------------------------------------------
 
 
-async def test_research_agent_real_inference_and_tool_call(
+def _make_gemini_text_response(text: str) -> MagicMock:
+    response = MagicMock()
+    response.text = text
+    candidate = MagicMock()
+    candidate.content.parts = [types.Part.from_text(text=text)]
+    response.candidates = [candidate]
+    return response
+
+
+def _make_gemini_tool_call_response(tool_name: str, tool_args: dict) -> MagicMock:
+    fc_part = types.Part.from_function_call(name=tool_name, args=tool_args)
+    candidate = MagicMock()
+    candidate.content.parts = [fc_part]
+    response = MagicMock()
+    response.text = None
+    response.candidates = [candidate]
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Tests with mocked Gemini + real MCP server
+# ---------------------------------------------------------------------------
+
+
+async def test_research_agent_tool_call_via_mock_gemini(
     running_mcp_server: str,
-    ollama_available: bool,
 ) -> None:
-    """Verify ResearchAgent uses local Ollama to invoke list_files through MCPHost."""
+    """Verify ResearchAgent invokes list_files through a real MCPHost using mocked Gemini."""
     mcp_url = f"{running_mcp_server}/mcp"
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        # Provide adequate timeout for local CPU inference on 8GB RAM development machine
-        from mas.config.settings import OllamaSettings
-        from mas.ollama.client import OllamaService
+        mock_gemini = MagicMock(spec=AgentGeminiService)
 
-        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=180.0))
-        agent = ResearchAgent(mcp_host=host, ollama_service=ollama_service)
+        # Turn 1: Gemini requests list_files
+        turn1 = _make_gemini_tool_call_response(
+            "list_files", {"directory": "documents"}
+        )
+        # Turn 2: Gemini produces final text after receiving tool result
+        turn2 = _make_gemini_text_response(
+            "The documents folder contains the listed files."
+        )
+        mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
+        agent = ResearchAgent(mcp_host=host, gemini_service=mock_gemini)
         res = await agent.run(
             "Please list all files in the documents workspace folder."
         )
 
         assert res.is_success is True
         assert res.iterations >= 1
-        # Model should have invoked list_files
         assert any(tc.tool_name == "list_files" for tc in res.tool_calls)
         assert len(res.content) > 0
 
 
-async def test_task_agent_real_inference_and_tool_call(
+async def test_task_agent_get_tasks_via_mock_gemini(
     running_mcp_server: str,
-    ollama_available: bool,
 ) -> None:
-    """Verify TaskAgent uses local Ollama to invoke get_tasks through MCPHost."""
+    """Verify TaskAgent invokes get_tasks through a real MCPHost using mocked Gemini."""
     mcp_url = f"{running_mcp_server}/mcp"
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        # Provide adequate timeout for local CPU inference on 8GB RAM development machine
-        from mas.config.settings import OllamaSettings
-        from mas.ollama.client import OllamaService
+        mock_gemini = MagicMock(spec=AgentGeminiService)
 
-        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=180.0))
-        agent = TaskAgent(mcp_host=host, ollama_service=ollama_service)
+        turn1 = _make_gemini_tool_call_response("get_tasks", {"limit": 2})
+        turn2 = _make_gemini_text_response("Here are the first 2 tasks in the system.")
+        mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
+        agent = TaskAgent(mcp_host=host, gemini_service=mock_gemini)
         res = await agent.run("List the first 2 tasks currently in the system.")
 
         assert res.is_success is True
         assert res.iterations >= 1
-        # Model should have invoked get_tasks or search_tasks
         assert any(
             tc.tool_name in ("get_tasks", "search_tasks") for tc in res.tool_calls
         )
         assert len(res.content) > 0
 
 
-async def test_task_agent_create_task_inference(
+async def test_task_agent_create_task_via_mock_gemini(
     running_mcp_server: str,
-    ollama_available: bool,
 ) -> None:
-    """Verify TaskAgent uses local Ollama to create a task via create_task tool."""
+    """Verify TaskAgent creates a task through a real MCPHost using mocked Gemini."""
     mcp_url = f"{running_mcp_server}/mcp"
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        from mas.config.settings import OllamaSettings
-        from mas.ollama.client import OllamaService
+        mock_gemini = MagicMock(spec=AgentGeminiService)
 
-        ollama_service = OllamaService(settings=OllamaSettings(timeout_seconds=180.0))
-        agent = TaskAgent(mcp_host=host, ollama_service=ollama_service)
+        turn1 = _make_gemini_tool_call_response(
+            "create_task", {"title": "Draft Methodology Section", "priority": "high"}
+        )
+        turn2 = _make_gemini_text_response(
+            "Created task 'Draft Methodology Section' with high priority."
+        )
+        mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
+        agent = TaskAgent(mcp_host=host, gemini_service=mock_gemini)
         res = await agent.run(
             "Create a new task with title 'Draft Methodology Section' and high priority."
         )
 
         assert res.is_success is True
         assert res.iterations >= 1
-        # Model should have called create_task
         assert any(tc.tool_name == "create_task" for tc in res.tool_calls)
         assert len(res.content) > 0
 
@@ -166,31 +195,18 @@ async def test_agent_schema_validation_against_real_mcp_server(
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        mock_ollama = MagicMock(spec=OllamaService)
+        mock_gemini = MagicMock(spec=AgentGeminiService)
 
-        # Turn 1: Model returns invalid argument type for 'limit' against real get_tasks schema
-        turn1_msg = MagicMock()
-        tc1 = MagicMock()
-        tc1.function.name = "get_tasks"
-        tc1.function.arguments = {"limit": "invalid_not_an_int"}
-        turn1_msg.tool_calls = [tc1]
-        turn1_msg.content = None
-
-        # Turn 2: Model handles error and provides final answer
-        turn2_msg = MagicMock()
-        turn2_msg.tool_calls = None
-        turn2_msg.content = (
+        # Model returns invalid argument type for 'limit' against real get_tasks schema
+        turn1 = _make_gemini_tool_call_response(
+            "get_tasks", {"limit": "invalid_not_an_int"}
+        )
+        turn2 = _make_gemini_text_response(
             "I could not query tasks because the limit parameter was invalid."
         )
+        mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
-        mock_ollama.chat = AsyncMock(
-            side_effect=[
-                MagicMock(message=turn1_msg),
-                MagicMock(message=turn2_msg),
-            ]
-        )
-
-        agent = TaskAgent(mcp_host=host, ollama_service=mock_ollama)
+        agent = TaskAgent(mcp_host=host, gemini_service=mock_gemini)
         res = await agent.run("Show tasks")
 
         assert res.is_success is False
@@ -207,28 +223,18 @@ async def test_agent_destructive_intent_safeguard_against_real_mcp_server(
     client_settings = MCPClientSettings(server_url=mcp_url)
 
     async with MCPHost(settings=client_settings) as host:
-        mock_ollama = MagicMock(spec=OllamaService)
+        mock_gemini = MagicMock(spec=AgentGeminiService)
 
         # Non-destructive prompt: Model tries to call delete_task
-        turn1_msg = MagicMock()
-        tc1 = MagicMock()
-        tc1.function.name = "delete_task"
-        tc1.function.arguments = {"task_id": "00000000-0000-0000-0000-000000000000"}
-        turn1_msg.tool_calls = [tc1]
-        turn1_msg.content = None
-
-        turn2_msg = MagicMock()
-        turn2_msg.tool_calls = None
-        turn2_msg.content = "I was unable to delete because deletion was not requested."
-
-        mock_ollama.chat = AsyncMock(
-            side_effect=[
-                MagicMock(message=turn1_msg),
-                MagicMock(message=turn2_msg),
-            ]
+        turn1 = _make_gemini_tool_call_response(
+            "delete_task", {"task_id": "00000000-0000-0000-0000-000000000000"}
         )
+        turn2 = _make_gemini_text_response(
+            "I was unable to delete because deletion was not requested."
+        )
+        mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
-        agent = TaskAgent(mcp_host=host, ollama_service=mock_ollama)
+        agent = TaskAgent(mcp_host=host, gemini_service=mock_gemini)
         res = await agent.run("Tell me about task 00000000-0000-0000-0000-000000000000")
 
         assert res.is_success is False
@@ -242,7 +248,7 @@ async def test_agent_destructive_intent_safeguard_against_real_mcp_server(
 async def test_agent_destructive_intent_safeguard_allows_authorized_deletion_against_real_mcp_server(
     running_mcp_server: str,
 ) -> None:
-    """Verify BaseAgent allows delete_task when user provides affirmative authorization to real MCP server."""
+    """Verify BaseAgent allows delete_task when user provides affirmative authorization."""
     mcp_url = f"{running_mcp_server}/mcp"
     client_settings = MCPClientSettings(server_url=mcp_url)
 
@@ -252,28 +258,14 @@ async def test_agent_destructive_intent_safeguard_allows_authorized_deletion_aga
         assert create_res.is_error is False
         task_id = create_res.data["task_id"]
 
-        mock_ollama = MagicMock(spec=OllamaService)
+        mock_gemini = MagicMock(spec=AgentGeminiService)
 
-        # Authorized prompt: explicit instruction and identifiable target
-        turn1_msg = MagicMock()
-        tc1 = MagicMock()
-        tc1.function.name = "delete_task"
-        tc1.function.arguments = {"task_id": task_id}
-        turn1_msg.tool_calls = [tc1]
-        turn1_msg.content = None
+        # Authorized prompt with explicit target
+        turn1 = _make_gemini_tool_call_response("delete_task", {"task_id": task_id})
+        turn2 = _make_gemini_text_response(f"Deleted task {task_id}.")
+        mock_gemini.chat = AsyncMock(side_effect=[turn1, turn2])
 
-        turn2_msg = MagicMock()
-        turn2_msg.tool_calls = None
-        turn2_msg.content = f"Deleted task {task_id} on MCP server."
-
-        mock_ollama.chat = AsyncMock(
-            side_effect=[
-                MagicMock(message=turn1_msg),
-                MagicMock(message=turn2_msg),
-            ]
-        )
-
-        agent = TaskAgent(mcp_host=host, ollama_service=mock_ollama)
+        agent = TaskAgent(mcp_host=host, gemini_service=mock_gemini)
         res = await agent.run(f"Please delete task {task_id}.")
 
         assert res.is_success is True

@@ -1,46 +1,9 @@
-"""Configuration settings for Ollama integration and local AI agents (Phase 9)."""
+"""Configuration settings for Google Gemini Multi-Agent System (DEC-033)."""
 
 from typing import Any
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
-
-
-class OllamaSettings(BaseSettings):
-    """Configuration settings for connecting to the local Ollama runtime."""
-
-    base_url: str = Field(
-        default="http://localhost:11434",
-        validation_alias="OLLAMA_BASE_URL",
-        description="Base URL for the locally running Ollama HTTP service",
-    )
-    model: str = Field(
-        default="llama3.2:3b",
-        validation_alias="OLLAMA_MODEL",
-        description="Local Ollama model identifier to use across agents (DEC-009)",
-    )
-    timeout_seconds: float = Field(
-        default=60.0,
-        validation_alias="OLLAMA_TIMEOUT_SECONDS",
-        description="Timeout in seconds for model inference requests",
-    )
-    temperature: float = Field(
-        default=0.1,
-        validation_alias="OLLAMA_TEMPERATURE",
-        description="Sampling temperature for deterministic tool calling and structured reasoning",
-    )
-    keep_alive: str = Field(
-        default="5m",
-        validation_alias="OLLAMA_KEEP_ALIVE",
-        description="How long to keep the single model instance in memory (8GB RAM optimization)",
-    )
-
-    model_config = SettingsConfigDict(
-        env_file=".env",
-        env_file_encoding="utf-8",
-        extra="ignore",
-        populate_by_name=True,
-    )
 
 
 class AgentSettings(BaseSettings):
@@ -183,9 +146,103 @@ class OrchestratorSettings(BaseSettings):
     )
 
 
-def get_ollama_settings() -> OllamaSettings:
-    """Return an instance of OllamaSettings loaded from environment."""
-    return OllamaSettings()
+class AgentGeminiSettings(BaseSettings):
+    """Configuration settings for Gemini-powered Research and Task agents (DEC-033).
+
+    Agents share the same GOOGLE_API_KEY as the orchestrator but use a
+    separate, configurable model identifier and multi-model fallback chain so they
+    can run a lighter/faster model than the orchestrator with automatic resilience.
+    """
+
+    api_key: str | None = Field(
+        default=None,
+        validation_alias="GOOGLE_API_KEY",
+        description="Google Gemini API key (shared with orchestrator)",
+    )
+    model: str = Field(
+        default="gemini-3.5-flash-lite",
+        validation_alias="AGENT_GEMINI_MODEL",
+        description="Gemini model identifier for Research and Task agents (legacy/fallback)",
+    )
+    primary_model: str | None = Field(
+        default=None,
+        validation_alias="AGENT_GEMINI_PRIMARY_MODEL",
+        description="Primary Gemini model identifier for agents (takes precedence over AGENT_GEMINI_MODEL)",
+    )
+    fallback_models: str | None = Field(
+        default=None,
+        validation_alias="AGENT_GEMINI_FALLBACK_MODELS",
+        description="Comma-separated list of fallback Gemini models for agents in priority order",
+    )
+    timeout_seconds: float = Field(
+        default=60.0,
+        validation_alias="AGENT_GEMINI_TIMEOUT_SECONDS",
+        description="Timeout in seconds for agent Gemini API requests",
+    )
+    temperature: float = Field(
+        default=0.1,
+        validation_alias="AGENT_GEMINI_TEMPERATURE",
+        description="Sampling temperature for agent function-calling (low = deterministic)",
+    )
+    model_retry_attempts: int = Field(
+        default=1,
+        validation_alias="AGENT_GEMINI_MODEL_RETRY_ATTEMPTS",
+        description="Number of retries per model for transient errors (503, timeouts) before switching",
+    )
+    model_retry_delay: float = Field(
+        default=0.5,
+        validation_alias="AGENT_GEMINI_MODEL_RETRY_DELAY",
+        description="Delay in seconds between retries for transient errors",
+    )
+
+    def __init__(self, **values: Any) -> None:
+        super().__init__(**values)
+        if "model" in values and "primary_model" not in values:
+            self.primary_model = values["model"]
+        elif self.primary_model and "model" not in values:
+            self.model = self.primary_model
+
+    @property
+    def model_candidates(self) -> list[str]:
+        """Return the deduplicated, ordered list of model candidates for agents.
+
+        Priority order:
+        1. primary_model (or model fallback)
+        2. fallback_models (comma-separated)
+        """
+        raw_candidates: list[str] = []
+        first_model = (self.primary_model or self.model or "").strip()
+        if first_model:
+            raw_candidates.append(first_model)
+
+        if self.fallback_models:
+            for item in self.fallback_models.split(","):
+                cleaned = item.strip()
+                if cleaned:
+                    raw_candidates.append(cleaned)
+
+        seen: set[str] = set()
+        candidates: list[str] = []
+        for m in raw_candidates:
+            if m not in seen:
+                seen.add(m)
+                candidates.append(m)
+
+        if not candidates:
+            candidates = ["gemini-3.5-flash-lite"]
+        return candidates
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        env_file_encoding="utf-8",
+        extra="ignore",
+        populate_by_name=True,
+    )
+
+
+def get_agent_gemini_settings() -> AgentGeminiSettings:
+    """Return an instance of AgentGeminiSettings loaded from environment."""
+    return AgentGeminiSettings()
 
 
 def get_agent_settings() -> AgentSettings:

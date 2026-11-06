@@ -56,8 +56,8 @@ def seeded_agents_and_tasks() -> dict[str, Any]:
             code="TEST-AGENT-001",
             role="research",
             description="Agent for testing research role.",
-            model="llama3.2:3b",
-            provider="ollama",
+            model="gemini-3.5-flash-lite",
+            provider="google",
             status="active",
             capabilities={
                 "functional_capabilities": ["research", "summarization"],
@@ -71,8 +71,8 @@ def seeded_agents_and_tasks() -> dict[str, Any]:
             code="TEST-AGENT-002",
             role="task_management",
             description="Agent for testing task management.",
-            model="llama3.2:3b",
-            provider="ollama",
+            model="gemini-3.5-flash-lite",
+            provider="google",
             status="inactive",
             capabilities=["task_management", "create_task", "tasks://pending"],
         )
@@ -209,8 +209,8 @@ async def test_get_agent_info_tool(
         assert data["name"] == "Integration Test Research Agent"
         assert data["code"] == "TEST-AGENT-001"
         assert data["role"] == "research"
-        assert data["model"] == "llama3.2:3b"
-        assert data["provider"] == "ollama"
+        assert data["model"] == "gemini-3.5-flash-lite"
+        assert data["provider"] == "google"
         assert data["status"] == "active"
         assert "capabilities" in data
 

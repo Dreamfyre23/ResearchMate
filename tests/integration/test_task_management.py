@@ -57,8 +57,8 @@ def seeded_agent() -> dict[str, Any]:
             code="TM-AGENT-001",
             role="task_management",
             description="Agent for testing Task Management attribution.",
-            model="llama3.2:3b",
-            provider="ollama",
+            model="gemini-3.5-flash-lite",
+            provider="google",
             status="active",
             capabilities=[],
         )

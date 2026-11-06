@@ -79,7 +79,7 @@ class Agent(Base):
     provider: Mapped[str | None] = mapped_column(
         String(50),
         nullable=True,
-        doc="Model provider (e.g. Ollama, Google).",
+        doc="Model provider (e.g. Google, Gemini).",
     )
     status: Mapped[str] = mapped_column(
         String(20),

@@ -1,7 +1,8 @@
-"""Research Agent implementation for ResearchMate (Phase 9).
+"""Research Agent implementation for ResearchMate (DEC-033).
 
-Specialized local AI agent using Ollama (llama3.2:3b) to process research requests,
-inspect workspace documents, and manage research notes through MCPHost (DEC-003, DEC-009).
+Specialized AI agent using Google Gemini native function calling to process research
+requests, inspect workspace documents, and manage research notes through
+MCPHost (DEC-003, DEC-033).
 """
 
 import asyncio
@@ -11,9 +12,9 @@ import sys
 from client_mcp.config import get_client_settings
 from client_mcp.host import MCPHost
 from mas.agents.base import BaseAgent
+from mas.agents.gemini_agent_service import AgentGeminiService
 from mas.agents.research_agent.prompts import RESEARCH_AGENT_SYSTEM_PROMPT
-from mas.config.settings import AgentSettings, OllamaSettings
-from mas.ollama.client import OllamaService
+from mas.config.settings import AgentGeminiSettings, AgentSettings
 
 logger = logging.getLogger(__name__)
 
@@ -39,17 +40,17 @@ class ResearchAgent(BaseAgent):
     def __init__(
         self,
         mcp_host: MCPHost,
-        ollama_service: OllamaService | None = None,
+        gemini_service: AgentGeminiService | None = None,
         agent_settings: AgentSettings | None = None,
-        ollama_settings: OllamaSettings | None = None,
+        gemini_settings: AgentGeminiSettings | None = None,
     ) -> None:
-        service = ollama_service or OllamaService(settings=ollama_settings)
+        service = gemini_service or AgentGeminiService(settings=gemini_settings)
         super().__init__(
             agent_name="Research Agent",
             system_prompt=RESEARCH_AGENT_SYSTEM_PROMPT,
             permitted_tools=RESEARCH_AGENT_PERMITTED_TOOLS,
             mcp_host=mcp_host,
-            ollama_service=service,
+            gemini_service=service,
             settings=agent_settings,
         )
 
@@ -72,12 +73,12 @@ async def run_standalone_cli() -> int:
     async with MCPHost(settings=client_settings) as host:
         agent = ResearchAgent(mcp_host=host)
 
-        print("[1/2] Verifying Ollama and model availability...")
+        print("[1/2] Verifying Gemini agent service configuration...")
         try:
-            await agent.ollama_service.ensure_model_available()
-            print(f"      Ollama model '{agent.ollama_service.model_name}' verified.")
+            _ = agent.gemini_service.client
+            print(f"      Gemini model '{agent.gemini_service.model_name}' configured.")
         except Exception as exc:  # noqa: BLE001
-            print(f"[ERROR] Ollama verification failed: {exc}", file=sys.stderr)
+            print(f"[ERROR] Gemini configuration failed: {exc}", file=sys.stderr)
             return 1
 
         print("\n[2/2] Running Research Agent reasoning loop...")

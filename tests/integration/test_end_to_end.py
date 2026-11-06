@@ -426,10 +426,10 @@ async def test_e2e_mcp_server_unavailable_handled_gracefully() -> None:
     assert not host.is_connected
 
 
-async def test_e2e_ollama_unavailable_reports_clear_agent_error(
+async def test_e2e_agent_service_unavailable_reports_clear_error(
     running_mcp_server: str,
 ) -> None:
-    """Verify orchestrator reports agent failure when Ollama is unavailable without crashing application."""
+    """Verify orchestrator reports agent failure when sub-agent service is unavailable without crashing application."""
     mcp_url = f"{running_mcp_server}/mcp"
     client_settings = MCPClientSettings(server_url=mcp_url)
 
@@ -449,15 +449,15 @@ async def test_e2e_ollama_unavailable_reports_clear_agent_error(
             )
         )
         mock_gemini.synthesize = AsyncMock(
-            return_value="Task Agent failed: Ollama daemon not reachable at localhost:11434."
+            return_value="Task Agent failed: Gemini API service unavailable for sub-agent."
         )
 
-        from mas.ollama.exceptions import OllamaServiceUnavailableError
+        from mas.agents.gemini_agent_service import AgentGeminiServiceUnavailableError
 
         mock_task = MagicMock(spec=TaskAgent)
         mock_task.run = AsyncMock(
-            side_effect=OllamaServiceUnavailableError(
-                "Cannot connect to Ollama daemon at localhost:11434"
+            side_effect=AgentGeminiServiceUnavailableError(
+                "Cannot connect to Gemini API for sub-agent"
             )
         )
 
@@ -473,8 +473,8 @@ async def test_e2e_ollama_unavailable_reports_clear_agent_error(
         assert res.is_success is False
         assert len(res.results) == 1
         assert res.results[0].status == ExecutionStatus.FAILED
-        assert "Cannot connect to Ollama daemon" in str(res.results[0].error)
-        assert "Ollama daemon not reachable" in res.content
+        assert "Cannot connect to Gemini API" in str(res.results[0].error)
+        assert "service unavailable" in res.content.lower()
 
 
 async def test_e2e_gemini_unavailable_uses_deterministic_fallback(

@@ -21,6 +21,7 @@ from mas.agents.research_agent.agent import ResearchAgent
 from mas.agents.task_agent.agent import TaskAgent
 from mas.config.settings import get_gemini_settings
 from mas.orchestrator.exceptions import (
+    GeminiConfigurationError,
     GeminiRateLimitError,
     GeminiServiceUnavailableError,
     GeminiTimeoutError,
@@ -272,6 +273,7 @@ async def test_live_gemini_service_plan_and_synthesize() -> None:
         GeminiServiceUnavailableError,
         GeminiRateLimitError,
         GeminiTimeoutError,
+        GeminiConfigurationError,
     ) as exc:
         pytest.skip(f"Live Gemini API temporarily unavailable: {exc}")
 
